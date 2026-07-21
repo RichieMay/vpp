@@ -317,7 +317,7 @@ if(VPP_HOST_TOOLS_ONLY)
 elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux|FreeBSD")
   find_package(OpenSSL)
   set(SUBDIRS
-    vppinfra svm vlib vlibmemory vlibapi vnet vpp vat vat2 vcl vpp-api
+    vppinfra svm vlib vlibmemory vlibapi vnet vpp vat vat2 vcl vcl2 vpp-api
     plugins drivers crypto_engines tools/vppapigen tools/g2 tools/perftool cmake
     pkg
     tools/appimage

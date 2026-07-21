@@ -1,0 +1,1247 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 vpp_runtime
+ *
+ * ldp2 —— LD_PRELOAD 拦截层（P4a：核心 socket/connect/read/write/recv/send/close）。
+ *
+ * 独立于 src/vcl/ldp.c。把未改 app 的 libc socket 调用 transparently 路由到 vcl2：
+ *   socket()  → vcl2_session_create()，返回合成 fd（fd = base + handle）
+ *   connect() → vcl2_session_connect()
+ *   read/recv → vcl2_session_recv()
+ *   write/send→ vcl2_session_send()
+ *   close()   → vcl2_session_close()（单侧：只丢 app 侧缓存槽）
+ *
+ * 非 vcl2 的 fd（真实内核 fd）一律 passthrough 到 dlsym(RTLD_NEXT) 拿到的真 libc。
+ * 仅拦截 AF_INET/AF_INET6 + SOCK_STREAM；其余（unix dgram、raw 等）走 libc。
+ *
+ * 用法：LD_PRELOAD=libvcl2_ldpreload.so <app>
+ *
+ * P4a 范围：阻塞式 socket 客户端（socket→connect→write→read→close）。
+ * epoll/accept/listen/bind/fork 在 P4b/P5。
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <sys/select.h>
+#include <sys/ioctl.h>
+#include <sys/uio.h>
+#include <sys/sendfile.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <time.h>
+#include <signal.h>
+#include <netinet/in.h>
+#include <stdarg.h>
+
+#include "vcl2.h"
+#include "vcl2_private.h"
+
+#define LDP2_DBG(...)                                                          \
+  do                                                                          \
+    {                                                                         \
+      if (vcl2_debug)                                                         \
+	{                                                                     \
+	  fprintf (stderr, "ldp2<%d>: ", (int) getpid ());                    \
+	  fprintf (stderr, __VA_ARGS__);                                      \
+	  fprintf (stderr, "\n");                                             \
+	}                                                                     \
+    }                                                                         \
+  while (0)
+
+/* ---------- 真 libc 函数指针（懒解析） ---------- */
+static int (*libc_socket) (int, int, int);
+static int (*libc_connect) (int, const struct sockaddr *, socklen_t);
+static ssize_t (*libc_read) (int, void *, size_t);
+static ssize_t (*libc_write) (int, const void *, size_t);
+static ssize_t (*libc_recv) (int, void *, size_t, int);
+static ssize_t (*libc_send) (int, const void *, size_t, int);
+static int (*libc_close) (int);
+static int (*libc_epoll_create1) (int);
+static int (*libc_epoll_ctl) (int, int, int, struct epoll_event *);
+static int (*libc_epoll_wait) (int, struct epoll_event *, int, int);
+static int (*libc_bind) (int, const struct sockaddr *, socklen_t);
+static int (*libc_listen) (int, int);
+static int (*libc_accept4) (int, struct sockaddr *, socklen_t *, int);
+static int (*libc_accept) (int, struct sockaddr *, socklen_t *);
+static int (*libc_setsockopt) (int, int, int, const void *, socklen_t);
+static int (*libc_getsockopt) (int, int, int, void *, socklen_t *);
+static int (*libc_getsockname) (int, struct sockaddr *, socklen_t *);
+static int (*libc_getpeername) (int, struct sockaddr *, socklen_t *);
+static int (*libc_poll) (struct pollfd *, nfds_t, int);
+static int (*libc_select) (int, fd_set *, fd_set *, fd_set *, struct timeval *);
+static int (*libc_pselect) (int, fd_set *, fd_set *, fd_set *, const struct timespec *,
+			    const sigset_t *);
+static int (*libc_fcntl) (int, int, ...);
+static int (*libc_fcntl64) (int, int, ...);
+static int (*libc_ioctl) (int, unsigned long, ...);
+static ssize_t (*libc_writev) (int, const struct iovec *, int);
+static ssize_t (*libc_readv) (int, const struct iovec *, int);
+static ssize_t (*libc_sendfile) (int, int, off_t *, size_t);
+static int (*libc_shutdown) (int, int);
+
+static void
+ldp2_resolve_libc (void)
+{
+  libc_socket = dlsym (RTLD_NEXT, "socket");
+  libc_connect = dlsym (RTLD_NEXT, "connect");
+  libc_read = dlsym (RTLD_NEXT, "read");
+  libc_write = dlsym (RTLD_NEXT, "write");
+  libc_recv = dlsym (RTLD_NEXT, "recv");
+  libc_send = dlsym (RTLD_NEXT, "send");
+  libc_close = dlsym (RTLD_NEXT, "close");
+  libc_epoll_create1 = dlsym (RTLD_NEXT, "epoll_create1");
+  libc_epoll_ctl = dlsym (RTLD_NEXT, "epoll_ctl");
+  libc_epoll_wait = dlsym (RTLD_NEXT, "epoll_wait");
+  libc_bind = dlsym (RTLD_NEXT, "bind");
+  libc_listen = dlsym (RTLD_NEXT, "listen");
+  libc_accept4 = dlsym (RTLD_NEXT, "accept4");
+  libc_accept = dlsym (RTLD_NEXT, "accept");
+  libc_setsockopt = dlsym (RTLD_NEXT, "setsockopt");
+  libc_getsockopt = dlsym (RTLD_NEXT, "getsockopt");
+  libc_getsockname = dlsym (RTLD_NEXT, "getsockname");
+  libc_getpeername = dlsym (RTLD_NEXT, "getpeername");
+  libc_poll = dlsym (RTLD_NEXT, "poll");
+  libc_select = dlsym (RTLD_NEXT, "select");
+  libc_pselect = dlsym (RTLD_NEXT, "pselect");
+  libc_fcntl = dlsym (RTLD_NEXT, "fcntl");
+  libc_fcntl64 = dlsym (RTLD_NEXT, "fcntl64");
+  libc_ioctl = dlsym (RTLD_NEXT, "ioctl");
+  libc_writev = dlsym (RTLD_NEXT, "writev");
+  libc_readv = dlsym (RTLD_NEXT, "readv");
+  libc_sendfile = dlsym (RTLD_NEXT, "sendfile");
+  libc_shutdown = dlsym (RTLD_NEXT, "shutdown");
+}
+
+/* ---------- vcl2 初始化（对齐原版 VCL ldp.c：eager constructor + 预置 flag） ----------
+ *
+ * 与原版 VCL 同机制（不再用 pthread_once / mutex / __thread）：
+ *  - eager：constructor（main 之前）就完成 attach；attach 失败则 _exit(1) 杀进程
+ *    （与 VCL ldp_constructor 行为一致：没挂上 VPP 就别让 app 起来）。
+ *  - 预置 flag：ldp2_init_done = 1 置于 vcl2_app_attach 之【前】。attach 内部
+ *    clib_socket_init 会调 libc socket()/connect()，那些已被本文件拦截 → 拦截器
+ *    开头的 ldp2_init_check() 看到 done==1 直接返回，不重入 init（否则死循环/死锁）。
+ *  - 域过滤：SAPI 的 AF_UNIX socket 不满足 AF_INET/INET6 条件 → 落 else 走 libc_socket，
+ *    本就不会建 vcl2 session。
+ */
+static int ldp2_init_done;
+
+/* 返回 0=成功，非 0=失败（errno 风格）。成功时 ldp2_init_done=1。 */
+static int
+ldp2_init (void)
+{
+  int rv;
+  const char *name;
+
+  if (ldp2_init_done)
+    return 0;
+
+  ldp2_resolve_libc ();		/* 确保 libc 指针就绪（attach 内部重入拦截器要用） */
+  name = getenv ("VCL2_APP_NAME");
+  rv = vcl2_init (name && name[0] ? name : "ldp2_app");
+  if (rv)
+    {
+      LDP2_DBG ("vcl2_init failed: %d", rv);
+      return rv;
+    }
+
+  ldp2_init_done = 1;		/* ★ 预置：attach 内部重入 socket() 时不重入 init */
+  rv = vcl2_app_attach ();
+  if (rv)
+    {
+      LDP2_DBG ("vcl2_app_attach failed: %d (%s) — is VPP up with app-socket-api?",
+		rv, strerror (-rv));
+      ldp2_init_done = 0;
+      return rv;
+    }
+  LDP2_DBG ("attached to VPP (app_index=%u wrk=%u)", vcl2_main.app_index,
+	    vcl2_main.app_wrk_index);
+  return 0;
+}
+
+/* 拦截器入口调用：未初始化则尝试初始化（已 done 则 O(1) 跳过，含 attach 途中的重入） */
+#define ldp2_init_check()                                                      \
+  do                                                                          \
+    {                                                                         \
+      if (!ldp2_init_done)                                                    \
+	ldp2_init ();                                                          \
+    }                                                                         \
+  while (0)
+
+/* eager：库加载时（main 之前）即 attach VPP；失败则 _exit(1)（对齐 VCL ldp_constructor） */
+__attribute__ ((constructor)) static void
+ldp2_ctor (void)
+{
+  setvbuf (stderr, NULL, _IONBF, 0);	/* 无缓冲：nginx 重定向 fd2 后 vcl2 调试打印也能即时落盘 */
+  if (ldp2_init () != 0)
+    {
+      fprintf (stderr, "\nldp2<%d>: ERROR: ldp2_ctor: attach VPP failed!\n",
+	       (int) getpid ());
+      _exit (1);
+    }
+}
+
+/* ---------- fd 分类 ---------- */
+/* 合成 fd = fd_base + handle。仅当 handle 在 session 缓存里（已 create）才算 vcl2 fd。 */
+static inline int
+ldp2_fd_is_vcl2 (int fd)
+{
+  vcl2_handle_t h;
+  if (!vcl2_is_init ())
+    return 0;
+  if (fd < (int) vcl2_main.fd_base)
+    return 0;
+  h = vcl2_fd_to_handle (fd);
+  return vcl2_session_get (h) != 0;
+}
+
+/* 前向声明（epoll 实现在 close() 之后） */
+void ldp2_ep_close (int epfd);
+
+/* ---------- 拦截器 ---------- */
+
+int
+socket (int domain, int type, int protocol)
+{
+  int t = type & ~(SOCK_CLOEXEC | SOCK_NONBLOCK);
+  ldp2_init_check ();
+
+  /* 只接 IPv4/IPv6 TCP；其余原样走 libc */
+  if ((domain == AF_INET || domain == AF_INET6) && t == SOCK_STREAM &&
+      vcl2_is_init () && vcl2_main.app_index)
+    {
+      int h = vcl2_session_create (VCL2_PROTO_TCP,
+				   (type & SOCK_NONBLOCK) ? 1 : 0);
+      if (h < 0)
+	{
+	  errno = -h;
+	  return -1;
+	}
+      int fd = vcl2_handle_to_fd ((vcl2_handle_t) h);
+      LDP2_DBG ("socket(AF %d STREAM) -> synthetic fd=%d (handle=%d)", domain,
+		fd, h);
+      return fd;
+    }
+  return libc_socket (domain, type, protocol);
+}
+
+int
+connect (int fd, const struct sockaddr *addr, socklen_t len)
+{
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd) && addr && len >= sizeof (struct sockaddr_in))
+    {
+      vcl2_handle_t h = vcl2_fd_to_handle (fd);
+      const struct sockaddr_in *a4 = (const struct sockaddr_in *) addr;
+      uint8_t ip[16];
+      uint8_t is_ip4;
+      uint16_t port;
+      int rv;
+
+      if (a4->sin_family == AF_INET)
+	{
+	  is_ip4 = 1;
+	  memcpy (ip, &a4->sin_addr, 4);
+	  port = ntohs (a4->sin_port);
+	}
+      else if (len >= sizeof (struct sockaddr_in6))
+	{
+	  const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *) addr;
+	  is_ip4 = 0;
+	  memcpy (ip, &a6->sin6_addr, 16);
+	  port = ntohs (a6->sin6_port);
+	}
+      else
+	{
+	  errno = EAFNOSUPPORT;
+	  return -1;
+	}
+      LDP2_DBG ("connect fd=%d handle=%d -> %s:%u", fd, h,
+		is_ip4 ? "ip4" : "ip6", port);
+      rv = vcl2_session_connect (h, is_ip4, ip, port);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      return 0;
+    }
+  return libc_connect (fd, addr, len);
+}
+
+ssize_t
+write (int fd, const void *buf, size_t n)
+{
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      ssize_t rv = vcl2_session_send (vcl2_fd_to_handle (fd), buf, n);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      return rv;
+    }
+  return libc_write (fd, buf, n);
+}
+
+/* writev：gather iovec 到临时缓冲再 vcl2_session_send（nginx HTTP 响应用 writev）。 */
+ssize_t
+writev (int fd, const struct iovec *iov, int iovcnt)
+{
+  ldp2_init_check ();
+  if (!ldp2_fd_is_vcl2 (fd))
+    return libc_writev (fd, iov, iovcnt);
+  size_t total = 0, i;
+  uint8_t stack[8192], *buf = stack;
+  uint8_t *heap = 0;
+  for (i = 0; i < (size_t) iovcnt; i++)
+    total += iov[i].iov_len;
+  if (total > sizeof (stack))
+    {
+      heap = malloc (total);
+      buf = heap ? heap : stack;
+    }
+  size_t off = 0;
+  for (i = 0; i < (size_t) iovcnt && off < (total > sizeof (stack) && !heap ? sizeof (stack) : total); i++)
+    {
+      size_t n = iov[i].iov_len;
+      if (off + n > (heap ? total : sizeof (stack)))
+	n = (heap ? total : sizeof (stack)) - off;
+      memcpy (buf + off, iov[i].iov_base, n);
+      off += n;
+    }
+  ssize_t rv = vcl2_session_send (vcl2_fd_to_handle (fd), buf, off);
+  free (heap);
+  if (rv < 0)
+    {
+      errno = -rv;
+      return -1;
+    }
+  return rv;
+}
+
+/* readv：vcl2_session_recv 到临时缓冲再 scatter 到 iovec。 */
+ssize_t
+readv (int fd, const struct iovec *iov, int iovcnt)
+{
+  ldp2_init_check ();
+  if (!ldp2_fd_is_vcl2 (fd))
+    return libc_readv (fd, iov, iovcnt);
+  size_t total = 0, i;
+  for (i = 0; i < (size_t) iovcnt; i++)
+    total += iov[i].iov_len;
+  uint8_t stack[8192], *buf = stack;
+  uint8_t *heap = 0;
+  if (total > sizeof (stack))
+    {
+      heap = malloc (total);
+      buf = heap ? heap : stack;
+      if (!heap)
+	total = sizeof (stack);
+    }
+  ssize_t rv = vcl2_session_recv (vcl2_fd_to_handle (fd), buf, total);
+  if (rv > 0)
+    {
+      size_t rem = rv;
+      for (i = 0; i < (size_t) iovcnt && rem > 0; i++)
+	{
+	  size_t n = iov[i].iov_len < rem ? iov[i].iov_len : rem;
+	  memcpy (iov[i].iov_base, buf + (rv - rem), n);
+	  rem -= n;
+	}
+    }
+  free (heap);
+  if (rv < 0)
+    {
+      errno = -rv;
+      return -1;
+    }
+  return rv;
+}
+
+/* sendfile：vcl2 fd 作 out_fd 时，读 in_fd（真文件）+ vcl2_session_send。
+ * nginx 默认 sendfile off；若开，这里兜底（in_fd 必须是真文件 fd）。 */
+ssize_t
+sendfile (int out_fd, int in_fd, off_t * offset, size_t count)
+{
+  ldp2_init_check ();
+  if (!ldp2_fd_is_vcl2 (out_fd))
+    return libc_sendfile (out_fd, in_fd, offset, count);
+  uint8_t stack[8192], *buf = stack;
+  uint8_t *heap = 0;
+  if (count > sizeof (stack))
+    {
+      heap = malloc (count);
+      buf = heap ? heap : stack;
+      if (!heap)
+	count = sizeof (stack);
+    }
+  off_t cur = offset ? *offset : 0;
+  ssize_t r = pread (in_fd, buf, count, cur);
+  if (r <= 0)
+    {
+      free (heap);
+      return r;
+    }
+  ssize_t s = vcl2_session_send (vcl2_fd_to_handle (out_fd), buf, r);
+  if (s > 0 && offset)
+    *offset = cur + s;
+  free (heap);
+  if (s < 0)
+    {
+      errno = -s;
+      return -1;
+    }
+  return s;
+}
+
+ssize_t
+read (int fd, void *buf, size_t n)
+{
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      ssize_t rv = vcl2_session_recv (vcl2_fd_to_handle (fd), buf, n);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      return rv;
+    }
+  return libc_read (fd, buf, n);
+}
+
+ssize_t
+send (int fd, const void *buf, size_t n, int flags)
+{
+  (void) flags;
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      ssize_t rv = vcl2_session_send (vcl2_fd_to_handle (fd), buf, n);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      return rv;
+    }
+  return libc_send (fd, buf, n, flags);
+}
+
+ssize_t
+recv (int fd, void *buf, size_t n, int flags)
+{
+  (void) flags;
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      ssize_t rv = vcl2_session_recv (vcl2_fd_to_handle (fd), buf, n);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      return rv;
+    }
+  return libc_recv (fd, buf, n, flags);
+}
+
+int
+close (int fd)
+{
+  ldp2_ep_close (fd);		/* 若是我们创建的 epoll fd，清侧表 */
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      LDP2_DBG ("close synthetic fd=%d", fd);
+      vcl2_session_close (vcl2_fd_to_handle (fd));
+      return 0;
+    }
+  return libc_close (fd);
+}
+
+/* ==================== epoll（P4b）====================
+ *
+ * 设计：返回【真】libc epoll fd（不是合成 fd）。app 看到的是普通 epoll fd：
+ *  - 真 fd 的 EPOLL_CTL_ADD/MOD/DEL 直接落到 libc_epoll_ctl（原生）。
+ *  - vcl2 fd 的注册记在侧表 ldp2_ep_t.regs[handle]，并把 app_event_queue 的
+ *    eventfd（mq->q.evtfd）加进真 epoll 一次。VPP 投事件时会 signal 该 eventfd。
+ *  - epoll_wait：先查各 vcl2 fd 的 fifo 即时就绪（rx 有数据→IN，tx 有空间→OUT）；
+ *    无就绪则阻塞在 libc_epoll_wait（eventfd 或真 fd 唤醒）；eventfd 唤醒后
+ *    排空 app_event_queue 再复查 vcl2 fd。真 fd 事件原样透传。
+ * 比 VCL 的 vep 简单（无 lt/et 链表、无 mq_evt_conns），但语义等价。
+ */
+
+/* 单个 vcl2 fd 在某 epoll 上的注册 */
+typedef struct
+{
+  struct epoll_event ev;	/* app 给的 events + data */
+  uint8_t in_use;
+} ldp2_evr_t;
+
+/* 一个 epoll fd 的侧表 */
+typedef struct
+{
+  int libc_epfd;		/* == 返回给 app 的真 fd */
+  uint8_t in_use;
+  uint8_t evtfd_added;		/* app_event_queue 的 eventfd 是否已加入 libc_epfd */
+  ldp2_evr_t *regs;		/* 按 handle 索引的 vcl2 fd 注册表 */
+} ldp2_ep_t;
+
+static ldp2_ep_t *ldp2_eps;
+static uword *ldp2_ep_index;	/* hash: libc_epfd -> ldp2_eps[] 下标 */
+
+static ldp2_ep_t *
+ldp2_ep_get (int epfd)
+{
+  uword *p = hash_get (ldp2_ep_index, epfd);
+  if (!p)
+    return 0;
+  ldp2_ep_t *ep = vec_elt_at_index (ldp2_eps, p[0]);
+  return ep->in_use ? ep : 0;
+}
+
+static ldp2_ep_t *
+ldp2_ep_alloc (int epfd)
+{
+  ldp2_ep_t *ep;
+  u32 idx;
+  for (idx = 0; idx < vec_len (ldp2_eps); idx++)
+    if (!ldp2_eps[idx].in_use)
+      {
+	ep = &ldp2_eps[idx];
+	memset (ep, 0, sizeof (*ep));
+	goto found;
+      }
+  vec_add2 (ldp2_eps, ep, 1);
+  idx = ep - ldp2_eps;
+  memset (ep, 0, sizeof (*ep));
+found:
+  ep->libc_epfd = epfd;
+  ep->in_use = 1;
+  hash_set (ldp2_ep_index, epfd, idx);
+  return ep;
+}
+
+void
+ldp2_ep_close (int epfd)
+{
+  ldp2_ep_t *ep = ldp2_ep_get (epfd);
+  if (!ep)
+    return;
+  vec_free (ep->regs);
+  ep->in_use = 0;
+  ep->regs = 0;
+  hash_unset (ldp2_ep_index, epfd);
+}
+
+/* app_event_queue 的 eventfd（VPP 投事件时 signal 它） */
+static int
+ldp2_app_evt_fd (void)
+{
+  if (!vcl2_is_init () || !vcl2_main.app_event_queue)
+    return -1;
+  return vcl2_main.app_event_queue->q.evtfd;
+}
+
+/* 把 eventfd 加进真 epoll（仅一次/epoll），用于 epoll_wait 唤醒 */
+static void
+ldp2_ep_ensure_evtfd (ldp2_ep_t * ep)
+{
+  int efd;
+  struct epoll_event e;
+  if (ep->evtfd_added)
+    return;
+  efd = ldp2_app_evt_fd ();
+  if (efd < 0)
+    return;
+  e.events = EPOLLIN;
+  e.data.fd = efd;		/* wait 时据此识别 eventfd 事件 */
+  if (libc_epoll_ctl (ep->libc_epfd, EPOLL_CTL_ADD, efd, &e) == 0)
+    ep->evtfd_added = 1;
+}
+
+/* 排空 app_event_queue 并派发：ACCEPTED 入 listener 的 accept_q，其余 IO 事件
+ *  靠 fifo 状态反映。同时让 eventfd 可被再次 arm。 */
+static void
+ldp2_drain_app_events (void)
+{
+  vcl2_dispatch_app_events ();
+}
+
+/* 查一个 vcl2 fd 的当前就绪事件。listener：accept_q 非空→EPOLLIN；
+ * 数据 session：rx 有数据→IN，tx 有空间→OUT。 */
+static uint32_t
+ldp2_session_ready (vcl2_session_t * s, uint32_t want)
+{
+  uint32_t ev = 0;
+  if (s->is_listener)
+    {
+      if ((want & EPOLLIN) && vec_len (s->accept_q) > 0)
+	ev |= EPOLLIN;
+      return ev;
+    }
+  /* peer 关：报 EPOLLIN 让 app 读取 → recv 返回 0(EOF)，app 关闭连接 */
+  if (s->peer_closed && (want & EPOLLIN))
+    ev |= EPOLLIN;
+  if ((want & EPOLLIN) && s->rx_fifo &&
+      svm_fifo_max_dequeue_cons (s->rx_fifo) > 0)
+    ev |= EPOLLIN;
+  if ((want & EPOLLOUT) && s->tx_fifo &&
+      svm_fifo_max_enqueue_prod (s->tx_fifo) > 0)
+    ev |= EPOLLOUT;
+  return ev;
+}
+
+/* 扫描 epoll 上所有 vcl2 fd 注册，把就绪的填进 events[]。返回新增数。 */
+static int
+ldp2_ep_collect_vcl2 (ldp2_ep_t * ep, struct epoll_event *events, int maxevents,
+		      int off)
+{
+  int n = off;
+  u32 h;
+  for (h = 0; h < vec_len (ep->regs) && n < maxevents; h++)
+    {
+      ldp2_evr_t *r = &ep->regs[h];
+      if (!r->in_use)
+	continue;
+      vcl2_session_t *s = vcl2_session_get (h);
+      if (!s)
+	continue;
+      /* listener 即使无 fifo 也可就绪（accept_q）；数据 session 需已连接 */
+      if (!s->is_listener && !s->rx_fifo)
+	continue;
+      uint32_t ev = ldp2_session_ready (s, r->ev.events);
+      if (ev)
+	{
+	  events[n].events = ev;
+	  events[n].data = r->ev.data;
+	  n++;
+	}
+    }
+  return n;
+}
+
+int
+epoll_create1 (int flags)
+{
+  int epfd;
+  ldp2_init_check ();
+  epfd = libc_epoll_create1 (flags);
+  if (epfd < 0)
+    return -1;
+  ldp2_ep_alloc (epfd);
+  LDP2_DBG ("epoll_create1 -> epfd=%d", epfd);
+  return epfd;
+}
+
+int
+epoll_create (int size)
+{
+  (void) size;
+  return epoll_create1 (EPOLL_CLOEXEC);
+}
+
+int
+epoll_ctl (int epfd, int op, int fd, struct epoll_event *event)
+{
+  ldp2_ep_t *ep;
+
+  ldp2_init_check ();
+  ep = ldp2_ep_get (epfd);
+  if (!ep)
+    return libc_epoll_ctl (epfd, op, fd, event);	/* 不是我们的 epoll */
+
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      /* vcl2 fd：记侧表 + 确保 eventfd 进真 epoll */
+      vcl2_handle_t h = vcl2_fd_to_handle (fd);
+      if (op == EPOLL_CTL_DEL)
+	{
+	  if (h < vec_len (ep->regs))
+	    ep->regs[h].in_use = 0;
+	  return 0;
+	}
+      if (!event)
+	{
+	  errno = EFAULT;
+	  return -1;
+	}
+      vec_validate (ep->regs, h);
+      ep->regs[h].ev = *event;
+      ep->regs[h].in_use = 1;
+      ldp2_ep_ensure_evtfd (ep);
+      return 0;
+    }
+  /* 真 fd：直接进真 epoll */
+  return libc_epoll_ctl (epfd, op, fd, event);
+}
+
+int
+epoll_wait (int epfd, struct epoll_event *events, int maxevents, int timeout)
+{
+  ldp2_ep_t *ep;
+  struct epoll_event tmp[64];
+  int efd, n, m, i, tmpcap, remaining, slice;
+
+  ldp2_init_check ();
+  if (maxevents <= 0 || timeout < -1)
+    {
+      errno = EINVAL;
+      return -1;
+    }
+  ep = ldp2_ep_get (epfd);
+  if (!ep)
+    return libc_epoll_wait (epfd, events, maxevents, timeout);	/* 非 vcl2 epoll */
+
+  efd = ldp2_app_evt_fd ();
+  tmpcap = sizeof (tmp) / sizeof (tmp[0]);
+  if (tmpcap > maxevents)
+    tmpcap = maxevents;
+  remaining = timeout;
+
+  /* 分片轮询：每 slice（≤50ms）重新 drain+collect 一次。这样即使 VPP 对某条
+   * 数据没 signal eventfd（如 accept 前已缓冲的 GET 无追溯 RX 事件），电平触发
+   * 的 fifo 就绪检查也能在 ≤slice 内发现数据。eventfd 真被 signal 时 libc_epoll_wait
+   * 会立即返回（不等满 slice），所以连通/正常路径无额外延迟。 */
+  for (;;)
+    {
+      ldp2_drain_app_events ();
+      n = ldp2_ep_collect_vcl2 (ep, events, maxevents, 0);
+      if (n > 0 || timeout == 0)
+	return n;
+
+      slice = (remaining < 0 || remaining > 50) ? 50 : remaining;
+      m = libc_epoll_wait (ep->libc_epfd, tmp, tmpcap, slice);
+      if (m < 0 && errno != EINTR)
+	return m;
+      for (i = 0; i < m; i++)
+	{
+	  if (efd >= 0 && tmp[i].data.fd == efd)
+	    {
+	      uint64_t b;
+	      read (efd, &b, sizeof (b));	/* 清 eventfd，下轮 collect */
+	    }
+	  else if (n < maxevents)
+	    events[n++] = tmp[i];	/* 真 fd 事件原样透传 */
+	}
+      if (n > 0)
+	return n;			/* 真 fd 有事件 */
+      if (remaining > 0)
+	{
+	  remaining -= slice;
+	  if (remaining <= 0)
+	    return 0;			/* 超时 */
+	}
+      /* remaining<0（无限）：继续循环复查 */
+    }
+}
+
+int
+epoll_pwait (int epfd, struct epoll_event *events, int maxevents, int timeout,
+	     const sigset_t * sigmask)
+{
+  (void) sigmask;		/* P4b：暂忽略 sigmask（nginx 默认不依赖） */
+  return epoll_wait (epfd, events, maxevents, timeout);
+}
+
+/* ---------- server 侧：bind / listen / accept / setsockopt / fcntl ----------
+ * bind：把本地地址存进 session（listen 时用）。vcl2 fd 无需真内核 bind。
+ * listen：vcl2_session_listen（发 LISTEN 等 BOUND）。
+ * accept/accept4：vcl2_session_accept（取 ACCEPTED 子 session → 新合成 fd）。
+ * setsockopt：vcl2 fd 上大多是 no-op（SO_REUSEADDR 等 VPP 语义不同），返回 0。
+ * fcntl：vcl2 fd 上记 nonblocking 标志（P4b 阻塞实现，flag 仅记录）。
+ */
+
+int
+bind (int fd, const struct sockaddr *addr, socklen_t len)
+{
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd) && addr)
+    {
+      vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
+      if (!s)
+	{
+	  errno = EBADF;
+	  return -1;
+	}
+      if (addr->sa_family == AF_INET && len >= sizeof (struct sockaddr_in))
+	{
+	  const struct sockaddr_in *a = (const struct sockaddr_in *) addr;
+	  s->lcl_is_ip4 = 1;
+	  memcpy (s->lcl_ip, &a->sin_addr, 4);
+	  s->lcl_port = ntohs (a->sin_port);
+	}
+      else if (addr->sa_family == AF_INET6 &&
+	       len >= sizeof (struct sockaddr_in6))
+	{
+	  const struct sockaddr_in6 *a = (const struct sockaddr_in6 *) addr;
+	  s->lcl_is_ip4 = 0;
+	  memcpy (s->lcl_ip, &a->sin6_addr, 16);
+	  s->lcl_port = ntohs (a->sin6_port);
+	}
+      LDP2_DBG ("bind fd=%d -> %u.%u.%u.%u:%u", fd, s->lcl_ip[0], s->lcl_ip[1],
+		s->lcl_ip[2], s->lcl_ip[3], s->lcl_port);
+      return 0;
+    }
+  return libc_bind (fd, addr, len);
+}
+
+int
+listen (int fd, int backlog)
+{
+  int rv;
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      rv = vcl2_session_listen (vcl2_fd_to_handle (fd), backlog);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      return 0;
+    }
+  return libc_listen (fd, backlog);
+}
+
+static int
+ldp2_accept_common (int fd, struct sockaddr *addr, socklen_t * addrlen,
+		    int flags)
+{
+  vcl2_handle_t nh;
+  int rv;
+
+  ldp2_init_check ();
+  if (!ldp2_fd_is_vcl2 (fd))
+    return -2;			/* 信号：不是 vcl2 fd */
+  rv = vcl2_session_accept (vcl2_fd_to_handle (fd), &nh);
+  LDP2_DBG ("ACCEPT lfd=%d -> rv=%d nh=%d (fd=%d)",
+	   fd, rv, nh, nh >= 0 ? (int) vcl2_main.fd_base + nh : -1);
+  if (rv < 0)
+    {
+      errno = -rv;
+      return -1;
+    }
+  /* 回填对端 sockaddr（nginx 等读 accept 返回的 peer addr；不填则拿到栈垃圾 → 连接被关） */
+  if (addr && addrlen)
+    {
+      vcl2_session_t *cs = vcl2_session_get ((vcl2_handle_t) nh);
+      if (cs && cs->rmt_is_ip4 && *addrlen >= (socklen_t) sizeof (struct sockaddr_in))
+	{
+	  struct sockaddr_in a;
+	  memset (&a, 0, sizeof (a));
+	  a.sin_family = AF_INET;
+	  memcpy (&a.sin_addr, cs->rmt_ip, 4);
+	  a.sin_port = cs->rmt_port;
+	  memcpy (addr, &a, sizeof (a));
+	  *addrlen = sizeof (a);
+	}
+      else if (cs && *addrlen >= (socklen_t) sizeof (struct sockaddr_in6))
+	{
+	  struct sockaddr_in6 a6;
+	  memset (&a6, 0, sizeof (a6));
+	  a6.sin6_family = AF_INET6;
+	  memcpy (&a6.sin6_addr, cs->rmt_ip, 16);
+	  a6.sin6_port = cs->rmt_port;
+	  memcpy (addr, &a6, sizeof (a6));
+	  *addrlen = sizeof (a6);
+	}
+    }
+  (void) flags;
+  return vcl2_handle_to_fd (nh);
+}
+
+int
+accept4 (int fd, struct sockaddr *addr, socklen_t * addrlen, int flags)
+{
+  int r = ldp2_accept_common (fd, addr, addrlen, flags);
+  if (r == -2)
+    return libc_accept4 (fd, addr, addrlen, flags);
+  return r;
+}
+
+int
+accept (int fd, struct sockaddr *addr, socklen_t * addrlen)
+{
+  int r = ldp2_accept_common (fd, addr, addrlen, 0);
+  if (r == -2)
+    return libc_accept (fd, addr, addrlen);
+  return r;
+}
+
+int
+setsockopt (int fd, int level, int optname, const void *optval, socklen_t optlen)
+{
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    return 0;			/* SO_REUSEADDR 等：vcl2/VPP 语义不同，静默成功 */
+  return libc_setsockopt (fd, level, optname, optval, optlen);
+}
+
+/* shutdown：正常优雅半关闭。SHUT_RD 本地标记；SHUT_WR/RDWR 发 SHUTDOWN 给 VPP
+ * （向 peer 发 FIN，连接仍可收）。镜像 VCL vls_shutdown。 */
+int
+shutdown (int fd, int how)
+{
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      int rv = vcl2_session_shutdown (vcl2_fd_to_handle (fd), how);
+      if (rv < 0)
+	{
+	  errno = -rv;
+	  return -1;
+	}
+      return 0;
+    }
+  return libc_shutdown (fd, how);
+}
+
+int
+fcntl (int fd, int cmd, ...)
+{
+  va_list ap;
+  int argval;
+  void *arg;
+  va_start (ap, cmd);
+  arg = va_arg (ap, void *);
+  argval = (int) (long) arg;
+  va_end (ap);
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
+      if (cmd == F_SETFL && s)
+	s->nonblocking = (argval & O_NONBLOCK) ? 1 : 0;
+      if (cmd == F_GETFL && s)
+	return O_RDWR | (s->nonblocking ? O_NONBLOCK : 0);
+      return 0;
+    }
+  return libc_fcntl (fd, cmd, arg);
+}
+
+/* ioctl：nginx 用 ioctl(FIONBIO) 设非阻塞（fcntl 的老式替代）。vcl2 fd 上记录标志。
+ */
+int
+ioctl (int fd, unsigned long cmd, ...)
+{
+  va_list ap;
+  void *arg;
+  int *iarg;
+  va_start (ap, cmd);
+  arg = va_arg (ap, void *);
+  va_end (ap);
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
+      if (cmd == FIONBIO && s && arg)
+	{
+	  iarg = (int *) arg;
+	  s->nonblocking = *iarg ? 1 : 0;
+	}
+      return 0;
+    }
+  return libc_ioctl (fd, cmd, arg);
+}
+
+/* getsockopt：vcl2 fd 上 SO_ERROR→0（无错误），其余返回成功不填（iperf 的
+ * TCP_INFO 等用于统计，失败非致命）。 */
+int
+getsockopt (int fd, int level, int optname, void *optval, socklen_t * optlen)
+{
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    {
+      if (optval && optlen && *optlen >= (socklen_t) sizeof (int))
+	*(int *) optval = 0;	/* SO_ERROR / 各 int 型选项统一 0 */
+      return 0;
+    }
+  return libc_getsockopt (fd, level, optname, optval, optlen);
+}
+
+/* getsockname/getpeername：vcl2 fd 上回填一个占位 IPv4 地址（iperf 仅用于日志）。
+ * TODO: 从 session 的 lcl/rmt 字段回填真实地址。 */
+static int
+ldp2_fill_name (int fd, struct sockaddr *addr, socklen_t * len)
+{
+  struct sockaddr_in a;
+  memset (&a, 0, sizeof (a));
+  a.sin_family = AF_INET;
+  if (addr && len && *len >= (socklen_t) sizeof (a))
+    {
+      memcpy (addr, &a, sizeof (a));
+      *len = sizeof (a);
+    }
+  (void) fd;
+  return 0;
+}
+
+int
+getsockname (int fd, struct sockaddr *addr, socklen_t * len)
+{
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    return ldp2_fill_name (fd, addr, len);
+  return libc_getsockname (fd, addr, len);
+}
+
+int
+getpeername (int fd, struct sockaddr *addr, socklen_t * len)
+{
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd))
+    return ldp2_fill_name (fd, addr, len);
+  return libc_getpeername (fd, addr, len);
+}
+
+/* ---------- poll / select / pselect ----------
+ * iperf3 等用 pselect/poll 等连接就绪（而非 epoll）。对含 vcl2 fd 的集合：
+ * 先 dispatch（把 ACCEPTED 入 listener accept_q），再按 fifo/accept_q 状态判就绪；
+ * 无就绪则阻塞在 eventfd 上（带真 fd 一起 poll），醒来重查。
+ */
+
+/* 把 vcl2 fd 的就绪位填进 pollfd->revents。返回该 fd 是否就绪。 */
+static int
+ldp2_poll_mark_vcl2 (struct pollfd *pfd)
+{
+  vcl2_session_t *s;
+  uint32_t want = 0, ev;
+  pfd->revents = 0;
+  s = vcl2_session_get (vcl2_fd_to_handle (pfd->fd));
+  if (!s)
+    {
+      pfd->revents = POLLNVAL;	/* vcl2 fd 但无 session */
+      return 1;
+    }
+  if (pfd->events & POLLIN)
+    want |= EPOLLIN;
+  if (pfd->events & POLLOUT)
+    want |= EPOLLOUT;
+  ev = ldp2_session_ready (s, want);
+  if (ev & EPOLLIN)
+    pfd->revents |= POLLIN;
+  if (ev & EPOLLOUT)
+    pfd->revents |= POLLOUT;
+  return pfd->revents != 0;
+}
+
+int
+poll (struct pollfd *fds, nfds_t nfds, int timeout)
+{
+  int efd, has_vcl2 = 0, n, slice;
+  nfds_t i;
+  struct pollfd *rp = 0;
+  int *map = 0;
+  nfds_t nr = 0;
+
+  ldp2_init_check ();
+  for (i = 0; i < nfds; i++)
+    {
+      fds[i].revents = 0;
+      if (ldp2_fd_is_vcl2 (fds[i].fd))
+	has_vcl2 = 1;
+    }
+  if (!has_vcl2)
+    return libc_poll (fds, nfds, timeout);
+
+  efd = ldp2_app_evt_fd ();
+  for (;;)
+    {
+      vcl2_dispatch_app_events ();
+      n = 0;
+      nr = 0;
+      for (i = 0; i < nfds; i++)
+	{
+	  if (ldp2_fd_is_vcl2 (fds[i].fd))
+	    {
+	      if (ldp2_poll_mark_vcl2 (&fds[i]))
+		n++;
+	    }
+	  else
+	    nr++;		/* 真 fd，收集起来交给 libc */
+	}
+      if (nr > 0)
+	{
+	  /* 非阻塞查真 fd，结果合并回 fds[] */
+	  vec_validate (rp, nr - 1);
+	  vec_validate (map, nr - 1);
+	  nr = 0;
+	  for (i = 0; i < nfds; i++)
+	    if (!ldp2_fd_is_vcl2 (fds[i].fd) && fds[i].fd >= 0)
+	      {
+		rp[nr] = fds[i];
+		rp[nr].revents = 0;
+		map[nr] = i;
+		nr++;
+	      }
+	  if (nr)
+	    {
+	      int rn = libc_poll (rp, nr, 0);
+	      for (i = 0; i < nr; i++)
+		{
+		  fds[map[i]].revents = rp[i].revents;
+		  if (rp[i].revents)
+		    n++;
+		}
+	      (void) rn;
+	    }
+	}
+      if (n > 0 || timeout == 0)
+	{
+	  vec_free (rp);
+	  vec_free (map);
+	  return n;
+	}
+      /* 无就绪：阻塞。把 eventfd + 真 fd 一起 poll 一个时间片 */
+      if (efd >= 0)
+	{
+	  struct pollfd ep[1] = { {.fd = efd,.events = POLLIN,.revents = 0} };
+	  slice = (timeout < 0 || timeout > 100) ? 100 : timeout;
+	  /* 真 fd 也想被及时唤醒 → 一并 poll（它们已在 fds 里，但含 vcl2 fd 会绕路；
+	   * 简化：只 poll eventfd，真 fd 每 slice 由上面非阻塞查一次） */
+	  libc_poll (ep, 1, slice);
+	  if (ep[0].revents & POLLIN)
+	    {
+	      uint64_t b;
+	      read (efd, &b, sizeof (b));
+	    }
+	}
+      else
+	usleep (10000);
+      if (timeout > 0)
+	{
+	  timeout -= slice;
+	  if (timeout <= 0)
+	    {
+	      vec_free (rp);
+	      vec_free (map);
+	      return 0;
+	    }
+	}
+    }
+}
+
+/* select：翻译成对每个 fd 查就绪。vcl2 fd 用 ldp2_session_ready，真 fd 用 libc。 */
+int
+select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
+	struct timeval *timeout)
+{
+  fd_set orset, owset;
+  int has_vcl2 = 0, n, fd;
+  int timeout_ms;
+  struct timeval tv0 = { 0, 0 };
+
+  ldp2_init_check ();
+  for (fd = 0; fd < nfds; fd++)
+    {
+      int wr = rset && FD_ISSET (fd, rset);
+      int ww = wset && FD_ISSET (fd, wset);
+      if ((wr || ww) && ldp2_fd_is_vcl2 (fd))
+	has_vcl2 = 1;
+    }
+  if (!has_vcl2)
+    return libc_select (nfds, rset, wset, eset, timeout);
+
+  timeout_ms = timeout ? (timeout->tv_sec * 1000 + timeout->tv_usec / 1000) : -1;
+  for (;;)
+    {
+      vcl2_dispatch_app_events ();
+      FD_ZERO (&orset);
+      FD_ZERO (&owset);
+      n = 0;
+      for (fd = 0; fd < nfds; fd++)
+	{
+	  if (!ldp2_fd_is_vcl2 (fd))
+	    continue;
+	  vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
+	  if (!s)
+	    continue;
+	  uint32_t want = 0;
+	  if (rset && FD_ISSET (fd, rset))
+	    want |= EPOLLIN;
+	  if (wset && FD_ISSET (fd, wset))
+	    want |= EPOLLOUT;
+	  uint32_t ev = ldp2_session_ready (s, want);
+	  if ((ev & EPOLLIN) && rset)
+	    { FD_SET (fd, &orset); n++; }
+	  if ((ev & EPOLLOUT) && wset)
+	    { FD_SET (fd, &owset); n++; }
+	}
+      /* 真 fd 非阻塞查一次（0 timeout） */
+      int maxr = -1;
+      for (fd = 0; fd < nfds; fd++)
+	if (!ldp2_fd_is_vcl2 (fd) &&
+	    ((rset && FD_ISSET (fd, rset)) || (wset && FD_ISSET (fd, wset))))
+	  maxr = fd;
+      if (maxr >= 0)
+	{
+	  fd_set tr, tw;
+	  FD_ZERO (&tr);
+	  FD_ZERO (&tw);
+	  for (fd = 0; fd < nfds; fd++)
+	    if (!ldp2_fd_is_vcl2 (fd))
+	      {
+		if (rset && FD_ISSET (fd, rset))
+		  FD_SET (fd, &tr);
+		if (wset && FD_ISSET (fd, wset))
+		  FD_SET (fd, &tw);
+	      }
+	  int rn = libc_select (maxr + 1, &tr, &tw, 0, &tv0);
+	  (void) rn;
+	  for (fd = 0; fd <= maxr; fd++)
+	    {
+	      if (FD_ISSET (fd, &tr))
+		{ FD_SET (fd, &orset); n++; }
+	      if (FD_ISSET (fd, &tw))
+		{ FD_SET (fd, &owset); n++; }
+	    }
+	}
+      if (n > 0 || (timeout && timeout->tv_sec == 0 && timeout->tv_usec == 0))
+	{
+	  if (rset)
+		*rset = orset;
+	  if (wset)
+		*wset = owset;
+	  if (eset)
+		FD_ZERO (eset);
+	  return n;
+	}
+      /* 阻塞一个 slice */
+      int efd = ldp2_app_evt_fd ();
+      if (efd >= 0)
+	{
+	  struct pollfd ep[1] = { {.fd = efd,.events = POLLIN,.revents = 0} };
+	  int slice = (timeout_ms < 0 || timeout_ms > 100) ? 100 : timeout_ms;
+	  libc_poll (ep, 1, slice);
+	  if (ep[0].revents & POLLIN)
+	    { uint64_t b; read (efd, &b, sizeof (b)); }
+	  if (timeout_ms >= 0)
+	    { timeout_ms -= slice; if (timeout_ms <= 0) { if(rset)*rset=orset; if(wset)*wset=owset; if(eset)FD_ZERO(eset); return 0; } }
+	}
+      else
+	usleep (10000);
+    }
+}
+
+int
+pselect (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
+	 const struct timespec *timeout, const sigset_t * sigmask)
+{
+  (void) sigmask;		/* P4：暂忽略 sigmask */
+  struct timeval tv;
+  if (timeout)
+    {
+      tv.tv_sec = timeout->tv_sec;
+      tv.tv_usec = timeout->tv_nsec / 1000;
+      return select (nfds, rset, wset, eset, &tv);
+    }
+  return select (nfds, rset, wset, eset, 0);
+}
