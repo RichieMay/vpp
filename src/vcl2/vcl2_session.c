@@ -664,9 +664,13 @@ vcl2_mq_wait_dispatch (double timeout_s)
 
   if (!mq)
     return;
-  pthread_mutex_lock (&vm->app_mq_lock);
+  /* timedwait 在锁外：仅 poll eventfd。worker 空闲 recv 循环若持锁等 1ms，会占据
+   * app_mq_lock 饿死主线程 select 的 dispatch（iperf end-of-test 等 ctrl 事件处理不了
+   * →client 挂；gdb 暂停 worker 即解套，证明确是 liveness/饿死）。锁外等待让主线程能
+   * 拿到锁做 dispatch。eventfd 已 O_NONBLOCK，锁外 timedwait 内部 read 不阻塞。*/
   if (timeout_s > 0)
     svm_msg_q_timedwait (mq, timeout_s);
+  pthread_mutex_lock (&vm->app_mq_lock);
   while (!svm_msg_q_sub (mq, &msg, SVM_Q_NOWAIT, 0))
     {
       session_event_t *e = svm_msg_q_msg_data (mq, &msg);
