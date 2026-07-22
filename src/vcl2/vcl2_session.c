@@ -20,6 +20,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 #include <arpa/inet.h>		/* htons */
 
 #include <vppinfra/clib_error.h>
@@ -27,6 +28,13 @@
 #include <vnet/session/session_types.h>		/* session_event_t, SESSION_CTRL_EVT_* */
 
 #include "vcl2_private.h"
+
+/* 阻塞 recv/send 的事件驱动等待兜底超时（秒）。事件驱动下几乎不触发——VPP 在 RX 入队
+ * / tx 空间释放时 signal eventfd，timedwait 会被即时唤醒；此值只是防"信号丢失"的
+ * 周期重查。不用短分片（0.1s 轮询）。*/
+#define VCL2_BLOCK_TIMEOUT 60.0
+/* 控制面（connect/listen/accept）等回复的总超时（秒）——正常回复经 eventfd 即时到达。*/
+#define VCL2_CTRL_TIMEOUT 5.0
 
 /* ---------- 可丢弃 session 缓存（假定调用者持有 sessions_lock）---------- */
 
@@ -207,39 +215,54 @@ vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t * ip,
     }
   app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &app_evt);
 
-  for (i = 0; i < 50; i++)
-    {
-      svm_msg_q_msg_t msg;
-      session_event_t *e;
-      session_connected_msg_t *cm;
-
-      if (svm_msg_q_timedwait (vm->app_event_queue, 0.1))
-	continue;
-      if (svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
-	continue;
-      e = svm_msg_q_msg_data (vm->app_event_queue, &msg);
-      et = e->event_type;
-      if (et == SESSION_CTRL_EVT_CONNECTED)
-	{
-	  int crv;
-	  cm = (session_connected_msg_t *) e->data;
-	  svm_msg_q_free_msg (vm->app_event_queue, &msg);
-	  if (cm->retval)
-	    return (int) cm->retval;
-	  /* 成功：写锁内 get-or-alloc + attach fifos */
-	  clib_rwlock_writer_lock (&vm->sessions_lock);
-	  vcl2_session_t *s = vcl2_session_get (h);
-	  if (!s)
-	    s = vcl2_session_alloc (h);
-	  crv = s ? vcl2_session_attach_connected (s, cm) : -ENOMEM;
-	  clib_rwlock_writer_unlock (&vm->sessions_lock);
-	  return crv;
-	}
-      svm_msg_q_free_msg (vm->app_event_queue, &msg);
-      if (et < 0)
-	return et;
-    }
-  return -ETIMEDOUT;
+  /* 事件驱动等 CONNECTED：deadline 限定（VCL2_CTRL_TIMEOUT），每次唤醒彻底排空找目标。
+   * CONNECTED 经 eventfd 即时到达，无短分片。*/
+  {
+    struct timespec t0;
+    long deadline_ms;
+    clock_gettime (CLOCK_MONOTONIC, &t0);
+    deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 +
+		  (long) (VCL2_CTRL_TIMEOUT * 1000);
+    for (;;)
+      {
+	struct timespec now;
+	long now_ms;
+	double rem;
+	svm_msg_q_msg_t msg;
+	session_event_t *e;
+	clock_gettime (CLOCK_MONOTONIC, &now);
+	now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	if (now_ms >= deadline_ms)
+	  return -ETIMEDOUT;
+	rem = (double) (deadline_ms - now_ms) / 1000.0;
+	if (svm_msg_q_timedwait (vm->app_event_queue, rem))
+	  continue;
+	while (!svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
+	  {
+	    e = svm_msg_q_msg_data (vm->app_event_queue, &msg);
+	    et = e->event_type;
+	    if (et == SESSION_CTRL_EVT_CONNECTED)
+	      {
+		int crv;
+		session_connected_msg_t *cm = (session_connected_msg_t *) e->data;
+		svm_msg_q_free_msg (vm->app_event_queue, &msg);
+		if (cm->retval)
+		  return (int) cm->retval;
+		/* 成功：写锁内 get-or-alloc + attach fifos */
+		clib_rwlock_writer_lock (&vm->sessions_lock);
+		vcl2_session_t *s = vcl2_session_get (h);
+		if (!s)
+		  s = vcl2_session_alloc (h);
+		crv = s ? vcl2_session_attach_connected (s, cm) : -ENOMEM;
+		clib_rwlock_writer_unlock (&vm->sessions_lock);
+		return crv;
+	      }
+	    svm_msg_q_free_msg (vm->app_event_queue, &msg);
+	    if (et < 0)
+	      return et;
+	  }
+      }
+  }
 }
 
 /*
@@ -250,11 +273,11 @@ int
 vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len)
 {
   vcl2_main_t *vm = &vcl2_main;
-  int n, i;
+  int n;
 
   if (!len)
     return 0;
-  for (i = 0; i < 50; i++)
+  for (;;)
     {
       int have_space;
       clib_rwlock_reader_lock (&vm->sessions_lock);
@@ -287,16 +310,14 @@ vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len)
 	  clib_rwlock_reader_unlock (&vm->sessions_lock);
 	  return n < 0 ? -EAGAIN : n;
 	}
-      /* 无空间：arm want-deq-ntf，解锁后等 */
+      /* 无空间：arm want-deq-ntf，解锁后【事件驱动】等——VPP 在 tx 空间释放时 signal
+       * eventfd，timedwait 即时唤醒。无短分片。*/
       svm_fifo_add_want_deq_ntf (s->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
       clib_rwlock_reader_unlock (&vm->sessions_lock);
-      if (svm_msg_q_timedwait (vm->app_event_queue, 0.1))
-	continue;
-      svm_msg_q_msg_t msg;
-      while (!svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
-	svm_msg_q_free_msg (vm->app_event_queue, &msg);
+      svm_msg_q_timedwait (vm->app_event_queue, VCL2_BLOCK_TIMEOUT);
+      vcl2_dispatch_app_events ();
     }
-  return -EAGAIN;
+  return -EAGAIN;			/* not reached */
 }
 
 /*
@@ -306,9 +327,9 @@ int
 vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len)
 {
   vcl2_main_t *vm = &vcl2_main;
-  int i, n;
+  int n;
 
-  for (i = 0; i < 50; i++)
+  for (;;)
     {
       uint8_t pc, nb;
       clib_rwlock_reader_lock (&vm->sessions_lock);
@@ -333,14 +354,12 @@ vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len)
 	return 0;
       if (nb)
 	return -EAGAIN;		/* 非阻塞 + 空：立即 EAGAIN */
-      /* 阻塞：等 RX 事件，不持锁 */
-      if (svm_msg_q_timedwait (vm->app_event_queue, 0.1))
-	continue;
-      svm_msg_q_msg_t msg;
-      while (!svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
-	svm_msg_q_free_msg (vm->app_event_queue, &msg);
+      /* 【事件驱动】阻塞：VPP 在 RX 入队时 signal eventfd（无条件），timedwait 即时
+       * 唤醒。无短分片、无忙等。peer 死→DISCONNECTED→dispatch 置 peer_closed→下一轮 EOF。*/
+      svm_msg_q_timedwait (vm->app_event_queue, VCL2_BLOCK_TIMEOUT);
+      vcl2_dispatch_app_events ();
     }
-  return -ETIMEDOUT;
+  return -ETIMEDOUT;			/* not reached */
 }
 
 /*
@@ -520,36 +539,50 @@ vcl2_session_listen (vcl2_handle_t h, uint32_t q_len)
     clib_memcpy_fast (&mp->ip, lcl_ip, 16);
   app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &app_evt);
 
-  for (i = 0; i < 50; i++)
-    {
-      svm_msg_q_msg_t msg;
-      session_event_t *e;
-      session_bound_msg_t *bm;
-
-      if (svm_msg_q_timedwait (vm->app_event_queue, 0.1))
-	continue;
-      if (svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
-	continue;
-      e = svm_msg_q_msg_data (vm->app_event_queue, &msg);
-      if (e->event_type == SESSION_CTRL_EVT_BOUND)
-	{
-	  bm = (session_bound_msg_t *) e->data;
-	  svm_msg_q_free_msg (vm->app_event_queue, &msg);
-	  if (bm->retval)
-	    return (int) bm->retval;
-	  clib_rwlock_writer_lock (&vm->sessions_lock);
-	  vcl2_session_t *ls = vcl2_session_get (h);
-	  if (ls)
-	    {
-	      ls->vpp_handle = bm->handle;
-	      ls->is_listener = 1;
-	    }
-	  clib_rwlock_writer_unlock (&vm->sessions_lock);
-	  return ls ? 0 : -EINVAL;
-	}
-      svm_msg_q_free_msg (vm->app_event_queue, &msg);
-    }
-  return -ETIMEDOUT;
+  /* 事件驱动等 BOUND：deadline 限定，每次唤醒彻底排空找目标。经 eventfd 即时到达。*/
+  {
+    struct timespec t0;
+    long deadline_ms;
+    clock_gettime (CLOCK_MONOTONIC, &t0);
+    deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 +
+		  (long) (VCL2_CTRL_TIMEOUT * 1000);
+    for (;;)
+      {
+	struct timespec now;
+	long now_ms;
+	double rem;
+	svm_msg_q_msg_t msg;
+	session_event_t *e;
+	clock_gettime (CLOCK_MONOTONIC, &now);
+	now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	if (now_ms >= deadline_ms)
+	  return -ETIMEDOUT;
+	rem = (double) (deadline_ms - now_ms) / 1000.0;
+	if (svm_msg_q_timedwait (vm->app_event_queue, rem))
+	  continue;
+	while (!svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
+	  {
+	    e = svm_msg_q_msg_data (vm->app_event_queue, &msg);
+	    if (e->event_type == SESSION_CTRL_EVT_BOUND)
+	      {
+		session_bound_msg_t *bm = (session_bound_msg_t *) e->data;
+		svm_msg_q_free_msg (vm->app_event_queue, &msg);
+		if (bm->retval)
+		  return (int) bm->retval;
+		clib_rwlock_writer_lock (&vm->sessions_lock);
+		vcl2_session_t *ls = vcl2_session_get (h);
+		if (ls)
+		  {
+		    ls->vpp_handle = bm->handle;
+		    ls->is_listener = 1;
+		  }
+		clib_rwlock_writer_unlock (&vm->sessions_lock);
+		return ls ? 0 : -EINVAL;
+	      }
+	    svm_msg_q_free_msg (vm->app_event_queue, &msg);
+	  }
+      }
+  }
 }
 
 /*
@@ -572,7 +605,7 @@ vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t * out)
   if (!is_listener)
     return -EINVAL;
 
-  for (i = 0; i < 50; i++)
+  for (;;)
     {
       vcl2_handle_t ch = 0;
       int got = 0;
@@ -604,11 +637,11 @@ vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t * out)
 	  *out = ch;
 	  return 0;
 	}
-      if (svm_msg_q_timedwait (vm->app_event_queue, 0.1))
-	continue;
+      /* 事件驱动等 ACCEPTED：经 eventfd 即时到达，dispatch 入 accept_q，下一轮 pop。*/
+      svm_msg_q_timedwait (vm->app_event_queue, VCL2_BLOCK_TIMEOUT);
       vcl2_dispatch_app_events ();
     }
-  return -EAGAIN;
+  return -EAGAIN;			/* not reached */
 }
 
 /*

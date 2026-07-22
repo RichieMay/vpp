@@ -599,9 +599,15 @@ ldp2_session_ready (vcl2_session_t * s, uint32_t want)
   if ((want & EPOLLIN) && s->rx_fifo &&
       svm_fifo_max_dequeue_cons (s->rx_fifo) > 0)
     ev |= EPOLLIN;
-  if ((want & EPOLLOUT) && s->tx_fifo &&
-      svm_fifo_max_enqueue_prod (s->tx_fifo) > 0)
-    ev |= EPOLLOUT;
+  if ((want & EPOLLOUT) && s->tx_fifo)
+    {
+      /* tx 有空间→EPOLLOUT；否则 arm want_deq_ntf，让 VPP 在 tx 空间释放时 signal
+       * eventfd（这样事件循环无需分片轮询即可被 EPOLLOUT 唤醒）。一次性，每轮扫描重 arm。*/
+      if (svm_fifo_max_enqueue_prod (s->tx_fifo) > 0)
+	ev |= EPOLLOUT;
+      else
+	svm_fifo_add_want_deq_ntf (s->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
+    }
   return ev;
 }
 
@@ -697,7 +703,8 @@ epoll_wait (int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
   ldp2_ep_t *ep;
   struct epoll_event tmp[64];
-  int efd, n, m, i, tmpcap, remaining, slice;
+  int efd, n, m, i, tmpcap;
+  long deadline_ms = -1;		/* 超时截止（CLOCK_MONOTONIC 毫秒）；-1=无限 */
 
   ldp2_init_check ();
   if (maxevents <= 0 || timeout < -1)
@@ -713,21 +720,39 @@ epoll_wait (int epfd, struct epoll_event *events, int maxevents, int timeout)
   tmpcap = sizeof (tmp) / sizeof (tmp[0]);
   if (tmpcap > maxevents)
     tmpcap = maxevents;
-  remaining = timeout;
+  if (timeout > 0)
+    {
+      struct timespec t0;
+      clock_gettime (CLOCK_MONOTONIC, &t0);
+      deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + timeout;
+    }
 
-  /* 分片轮询：每 slice（≤50ms）重新 drain+collect 一次。这样即使 VPP 对某条
-   * 数据没 signal eventfd（如 accept 前已缓冲的 GET 无追溯 RX 事件），电平触发
-   * 的 fifo 就绪检查也能在 ≤slice 内发现数据。eventfd 真被 signal 时 libc_epoll_wait
-   * 会立即返回（不等满 slice），所以连通/正常路径无额外延迟。 */
+  /* 事件驱动：每轮 drain+collect 后，用【完整剩余超时】阻塞在真 epoll（含 eventfd）
+   * 上，被 VPP 信号/真 fd/超时唤醒。只在"唤醒却无就绪 fd"时（如 eventfd 是别的
+   * session 的事件）才循环。无分片、无 usleep。eventfd 在 epoll_ctl ADD 时已加入
+   * libc_epfd（ldp2_ep_ensure_evtfd）。 */
   for (;;)
     {
+      int t;
       ldp2_drain_app_events ();
       n = ldp2_ep_collect_vcl2 (ep, events, maxevents, 0);
       if (n > 0 || timeout == 0)
 	return n;
 
-      slice = (remaining < 0 || remaining > 50) ? 50 : remaining;
-      m = libc_epoll_wait (ep->libc_epfd, tmp, tmpcap, slice);
+      if (deadline_ms < 0)
+	t = -1;
+      else
+	{
+	  struct timespec now;
+	  long now_ms;
+	  clock_gettime (CLOCK_MONOTONIC, &now);
+	  now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	  if (now_ms >= deadline_ms)
+	    return 0;
+	  t = (int) (deadline_ms - now_ms);
+	}
+
+      m = libc_epoll_wait (ep->libc_epfd, tmp, tmpcap, t);
       if (m < 0 && errno != EINTR)
 	return m;
       for (i = 0; i < m; i++)
@@ -735,20 +760,14 @@ epoll_wait (int epfd, struct epoll_event *events, int maxevents, int timeout)
 	  if (efd >= 0 && tmp[i].data.fd == efd)
 	    {
 	      uint64_t b;
-	      read (efd, &b, sizeof (b));	/* 清 eventfd，下轮 collect */
+	      read (efd, &b, sizeof (b));	/* 清 eventfd，下轮 drain+collect */
 	    }
 	  else if (n < maxevents)
 	    events[n++] = tmp[i];	/* 真 fd 事件原样透传 */
 	}
       if (n > 0)
 	return n;			/* 真 fd 有事件 */
-      if (remaining > 0)
-	{
-	  remaining -= slice;
-	  if (remaining <= 0)
-	    return 0;			/* 超时 */
-	}
-      /* remaining<0（无限）：继续循环复查 */
+      /* 否则（eventfd 唤醒或 EINTR）：循环重新 drain+collect */
     }
 }
 
@@ -1062,10 +1081,11 @@ ldp2_poll_mark (vcl2_session_t * s, struct pollfd *pfd)
 int
 poll (struct pollfd *fds, nfds_t nfds, int timeout)
 {
-  int efd, has_vcl2 = 0, n, slice;
+  int efd, has_vcl2 = 0, n, t;
   nfds_t i, nr;
   struct pollfd *rp = 0;
   int *map = 0;
+  long deadline_ms = -1;
 
   ldp2_init_check ();
   /* 快判是否含 vcl2 候选（fd>=base）；精确性由 get 在锁内确认 */
@@ -1079,8 +1099,14 @@ poll (struct pollfd *fds, nfds_t nfds, int timeout)
     return libc_poll (fds, nfds, timeout);
 
   efd = ldp2_app_evt_fd ();
-  vec_validate (rp, nfds);		/* 最多 nfds 个真 fd */
-  vec_validate (map, nfds);
+  vec_validate (rp, nfds + 1);		/* 真 fd + 1 个 eventfd 槽 */
+  vec_validate (map, nfds + 1);
+  if (timeout > 0)
+    {
+      struct timespec t0;
+      clock_gettime (CLOCK_MONOTONIC, &t0);
+      deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + timeout;
+    }
   for (;;)
     {
       vcl2_dispatch_app_events ();
@@ -1110,50 +1136,68 @@ poll (struct pollfd *fds, nfds_t nfds, int timeout)
 	    }
 	}
       clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
-      if (nr > 0)
+      if (n > 0 || timeout == 0)
 	{
-	  int rn = libc_poll (rp, nr, 0);	/* 非阻塞查真 fd */
+	  /* vcl2 就绪（或 timeout==0）：顺带非阻塞查真 fd，一并上报 */
+	  if (nr)
+	    libc_poll (rp, nr, 0);
 	  for (i = 0; i < nr; i++)
 	    {
 	      fds[map[i]].revents = rp[i].revents;
 	      if (rp[i].revents)
 		n++;
 	    }
-	  (void) rn;
-	}
-      if (n > 0 || timeout == 0)
-	{
 	  vec_free (rp);
 	  vec_free (map);
 	  return n;
 	}
-      /* 无就绪：阻塞一个 slice（不持锁） */
-      if (efd >= 0)
+      /* 无就绪：把 eventfd 追加到 rp，与真 fd 一起【单次完整超时】阻塞 */
+      if (efd < 0)
 	{
-	  struct pollfd ep[1] = { {.fd = efd,.events = POLLIN,.revents = 0} };
-	  slice = (timeout < 0 || timeout > 100) ? 100 : timeout;
-	  libc_poll (ep, 1, slice);
-	  if (ep[0].revents & POLLIN)
-	    {
-	      uint64_t b;
-	      read (efd, &b, sizeof (b));
-	    }
+	  vec_free (rp);
+	  vec_free (map);
+	  errno = ENOSYS;
+	  return -1;			/* 无 eventfd：不能事件驱动 */
 	}
+      rp[nr].fd = efd;
+      rp[nr].events = POLLIN;
+      rp[nr].revents = 0;
+      map[nr] = -1;			/* 标记 eventfd 槽 */
+      if (deadline_ms < 0)
+	t = -1;
       else
 	{
-	  usleep (10000);
-	  slice = 10;
-	}
-      if (timeout > 0)
-	{
-	  timeout -= slice;
-	  if (timeout <= 0)
+	  struct timespec now;
+	  long now_ms;
+	  clock_gettime (CLOCK_MONOTONIC, &now);
+	  now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	  if (now_ms >= deadline_ms)
 	    {
 	      vec_free (rp);
 	      vec_free (map);
 	      return 0;
 	    }
+	  t = (int) (deadline_ms - now_ms);
 	}
+      libc_poll (rp, nr + 1, t);
+      if (rp[nr].revents & POLLIN)
+	{
+	  uint64_t b;
+	  read (efd, &b, sizeof (b));	/* 清 eventfd，下轮 drain+重扫 */
+	}
+      for (i = 0; i < nr; i++)
+	{
+	  fds[map[i]].revents = rp[i].revents;
+	  if (rp[i].revents)
+	    n++;
+	}
+      if (n > 0)
+	{
+	  vec_free (rp);
+	  vec_free (map);
+	  return n;			/* 真 fd 就绪 */
+	}
+      /* 否则 eventfd 唤醒（或超时）：循环重新 drain+重扫 vcl2 */
     }
 }
 
@@ -1163,8 +1207,9 @@ select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
 	struct timeval *timeout)
 {
   fd_set orset, owset;
-  int has_vcl2 = 0, n, fd;
+  int has_vcl2 = 0, n, fd, efd, wait_ms, sel_nfds;
   int timeout_ms;
+  long deadline_ms = -1;
   struct timeval tv0 = { 0, 0 };
 
   ldp2_init_check ();
@@ -1180,11 +1225,17 @@ select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
     return libc_select (nfds, rset, wset, eset, timeout);
 
   timeout_ms = timeout ? (timeout->tv_sec * 1000 + timeout->tv_usec / 1000) : -1;
+  efd = ldp2_app_evt_fd ();
+  if (timeout_ms > 0)
+    {
+      struct timespec t0;
+      clock_gettime (CLOCK_MONOTONIC, &t0);
+      deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + timeout_ms;
+    }
   for (;;)
     {
       fd_set tr, tw;
       int maxr = -1;
-      int slice;
       vcl2_dispatch_app_events ();
       FD_ZERO (&orset);
       FD_ZERO (&owset);
@@ -1247,25 +1298,31 @@ select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
 	    FD_ZERO (eset);
 	  return n;
 	}
-      /* 阻塞一个 slice（不持锁） */
-      int efd = ldp2_app_evt_fd ();
-      if (efd >= 0)
+      /* 阻塞：把 eventfd 加入 tr，与真 fd 一起【单次完整超时】select */
+      if (efd < 0)
 	{
-	  struct pollfd ep[1] = { {.fd = efd,.events = POLLIN,.revents = 0} };
-	  slice = (timeout_ms < 0 || timeout_ms > 100) ? 100 : timeout_ms;
-	  libc_poll (ep, 1, slice);
-	  if (ep[0].revents & POLLIN)
-	    { uint64_t b; read (efd, &b, sizeof (b)); }
+	  if (rset)
+	    *rset = orset;
+	  if (wset)
+	    *wset = owset;
+	  if (eset)
+	    FD_ZERO (eset);
+	  errno = ENOSYS;
+	  return -1;			/* 无 eventfd：不能事件驱动 */
 	}
+      sel_nfds = maxr + 1;
+      if (efd >= sel_nfds)
+	sel_nfds = efd + 1;
+      FD_SET (efd, &tr);		/* eventfd 加入读集 */
+      if (deadline_ms < 0)
+	wait_ms = -1;
       else
 	{
-	  usleep (10000);
-	  slice = 10;
-	}
-      if (timeout_ms >= 0)
-	{
-	  timeout_ms -= slice;
-	  if (timeout_ms <= 0)
+	  struct timespec now;
+	  long now_ms;
+	  clock_gettime (CLOCK_MONOTONIC, &now);
+	  now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	  if (now_ms >= deadline_ms)
 	    {
 	      if (rset)
 		*rset = orset;
@@ -1275,7 +1332,45 @@ select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
 		FD_ZERO (eset);
 	      return 0;
 	    }
+	  wait_ms = (int) (deadline_ms - now_ms);
 	}
+      {
+	struct timeval wtv;
+	wtv.tv_sec = wait_ms / 1000;
+	wtv.tv_usec = (wait_ms % 1000) * 1000;
+	libc_select (sel_nfds, &tr, &tw, 0, wait_ms >= 0 ? &wtv : 0);
+      }
+      if (FD_ISSET (efd, &tr))
+	{
+	  uint64_t b;
+	  read (efd, &b, sizeof (b));	/* 清 eventfd，下轮 drain+重扫 */
+	  FD_CLR (efd, &tr);
+	}
+      /* 真 fd 就绪：合并进 orset/owset 并返回 */
+      for (fd = 0; fd <= maxr; fd++)
+	{
+	  if (FD_ISSET (fd, &tr))
+	    {
+	      FD_SET (fd, &orset);
+	      n++;
+	    }
+	  if (FD_ISSET (fd, &tw))
+	    {
+	      FD_SET (fd, &owset);
+	      n++;
+	    }
+	}
+      if (n > 0)
+	{
+	  if (rset)
+	    *rset = orset;
+	  if (wset)
+	    *wset = owset;
+	  if (eset)
+	    FD_ZERO (eset);
+	  return n;
+	}
+      /* 否则 eventfd 唤醒（或超时）：循环重新 drain+重扫 */
     }
 }
 
