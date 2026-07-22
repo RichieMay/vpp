@@ -316,7 +316,23 @@ vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len)
       n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
       pc = s->peer_closed;
       nb = s->nonblocking;
+      /* RX 流控反馈（对齐 VCL vppcom_session_read:2370）：读出数据后，若 VPP 在 rx_fifo 上
+       * arm 了 want_deq_ntf（零窗口恢复时 VPP 会 arm），须清标志并给 VPP 发 RX IO 事件，
+       * 让 VPP 及时更新接收窗口。否则 fifo 一旦填满（零窗口）VPP 收不到 drain 通知→窗口
+       * 不重开→client stall。锁内取字段+清标志，锁外发事件（避免 send 阻塞持读锁）。*/
+      int need_ntf = 0;
+      u32 ntf_sess = 0;
+      if (n > 0 && vm->vpp_evt_q
+	  && svm_fifo_needs_deq_ntf (s->rx_fifo, n))
+	{
+	  svm_fifo_clear_deq_ntf (s->rx_fifo);
+	  ntf_sess = s->rx_fifo->vpp_session_index;
+	  need_ntf = 1;
+	}
       clib_rwlock_reader_unlock (&vm->sessions_lock);
+      if (need_ntf)
+	app_send_io_evt_to_vpp (vm->vpp_evt_q, ntf_sess,
+				SESSION_IO_EVT_RX, SVM_Q_WAIT);
       if (n > 0)
 	return n;
       if (pc)
@@ -625,10 +641,11 @@ vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t * out)
 /*
  * mq 排空与分发（多线程串行化，A 修复）。
  *
- * timedwait(可选) 在 app_mq_lock【外】（仅 poll eventfd，不碰 mq 环）；app_mq_lock 内
- * 只做排空(sub) + 就地处理。理由：若 timedwait 持锁，worker 在 1ms poll 期间独占比锁，
- * 饿死主线程 select 的 dispatch（ctrl 事件如 end-of-test 处理不了→hang）。eventfd 已
- * O_NONBLOCK，锁外 timedwait 的内部 read 不会阻塞。
+ * timedwait(可选) 在 app_mq_lock【内】（持锁 poll eventfd + 排空 + 就地处理）。实测：
+ * timedwait 放锁外会让 worker 与主线程 select 在同一 eventfd 上并发 poll+read，反而引发
+ * 丢唤醒/重复 drain，导致 iperf MT 6/6 stall；持锁等待则串行化 wait+drain，6/6 通过。
+ * （持锁等待短期占 app_mq 不会饿死主线程——worker 仅在 fifo 空时等 1ms，数据流动时
+ * recv 直接返回不经此路径。）
  * 就地处理含 sessions_lock(W)（DISCONNECTED/ACCEPTED/CONNECTED/BOUND）。死锁分析：经审查
  * 【无任何路径在持有 sessions_lock 时获取 app_mq_lock】——所有数据/ctrl 路径都是先释放
  * sessions_lock 再取 app_mq_lock。故锁序单向 app_mq_lock→sessions_lock，无环、无死锁。
