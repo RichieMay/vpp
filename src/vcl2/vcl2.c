@@ -467,7 +467,8 @@ vcl2_init (const char *app_name)
     return rv;
 
   memset (vm, 0, sizeof (*vm));
-  pthread_mutex_init (&vm->lock, 0);
+  clib_rwlock_init (&vm->segment_table_lock);
+  clib_rwlock_init (&vm->sessions_lock);
   vm->fd_base = VCL2_FD_BASE_DEFAULT;
   vm->app_name = strdup (app_name ? app_name : "vcl2_app");
   vm->pid = getpid ();
@@ -502,9 +503,9 @@ vcl2_app_attach (void)
   int rv;
   if (!vcl2_main.is_init)
     return -EINVAL;
-  pthread_mutex_lock (&vcl2_main.lock);
+  /* attach 在 constructor（main 前）/ atfork child（子进程单线程）跑，不与数据面线程
+   * 并发；其段操作内部已用 segment_table_lock 保护，故无需外层锁。*/
   rv = vcl2_app_attach_locked ();
-  pthread_mutex_unlock (&vcl2_main.lock);
   return rv;
 }
 
@@ -514,9 +515,7 @@ vcl2_worker_register (void)
   int rv;
   if (!vcl2_main.is_init)
     return -EINVAL;
-  pthread_mutex_lock (&vcl2_main.lock);
   rv = vcl2_worker_register_locked ();
-  pthread_mutex_unlock (&vcl2_main.lock);
   return rv;
 }
 
@@ -556,7 +555,8 @@ vcl2_destroy (void)
   hash_free (vm->handle_to_session);
   free (vm->app_name);
   free (vm->sapi_socket_path);
-  pthread_mutex_destroy (&vm->lock);
+  clib_rwlock_free (&vm->segment_table_lock);
+  clib_rwlock_free (&vm->sessions_lock);
   memset (vm, 0, sizeof (*vm));
 }
 

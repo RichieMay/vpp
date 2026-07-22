@@ -9,6 +9,11 @@
  * VPP 侧检测 app 死后自行回收。无 app 侧段 free 协议。
  *
  * 复用 libsvm 的 fifo_segment_* （与 src/vcl/vcl_private.c 同一套机制）。
+ *
+ * 多线程（方案 C）：segment_table hash + segment_main 由 segment_table_lock（rwlock）
+ * 保护。attach=写锁，lookup/alloc_fifo/attach_mq=读锁。各公开函数自含加锁（内联
+ * hash_get，避免嵌套）。锁序：sessions_lock（外）→ segment_table_lock（内）—— 本文件
+ * 函数只取 segment_table_lock，不碰 sessions。
  */
 
 #include <string.h>
@@ -23,6 +28,7 @@
 int
 vcl2_segment_attach (u64 handle, char *name, int fd)
 {
+  vcl2_main_t *vm = &vcl2_main;
   fifo_segment_create_args_t a;
   int rv;
 
@@ -31,13 +37,16 @@ vcl2_segment_attach (u64 handle, char *name, int fd)
   a.segment_type = SSVM_SEGMENT_MEMFD;
   a.memfd_fd = fd;
 
-  rv = fifo_segment_attach (&vcl2_main.segment_main, &a);
+  clib_rwlock_writer_lock (&vm->segment_table_lock);
+  rv = fifo_segment_attach (&vm->segment_main, &a);
   if (rv)
     {
+      clib_rwlock_writer_unlock (&vm->segment_table_lock);
       VCL2_DBG ("segment_attach('%s') failed: %d", name, rv);
       return rv;
     }
-  hash_set (vcl2_main.segment_table, handle, a.new_segment_indices[0]);
+  hash_set (vm->segment_table, handle, a.new_segment_indices[0]);
+  clib_rwlock_writer_unlock (&vm->segment_table_lock);
   VCL2_DBG ("segment attached '%s' handle=%lu -> idx=%u", name, (unsigned long) handle,
 	   a.new_segment_indices[0]);
   return 0;
@@ -46,25 +55,35 @@ vcl2_segment_attach (u64 handle, char *name, int fd)
 u32
 vcl2_segment_lookup (u64 handle)
 {
-  uword *p = hash_get (vcl2_main.segment_table, handle);
-  return p ? (u32) p[0] : VCL2_INVALID_SEG_INDEX;
+  vcl2_main_t *vm = &vcl2_main;
+  uword *p;
+  u32 idx;
+  clib_rwlock_reader_lock (&vm->segment_table_lock);
+  p = hash_get (vm->segment_table, handle);
+  idx = p ? (u32) p[0] : VCL2_INVALID_SEG_INDEX;
+  clib_rwlock_reader_unlock (&vm->segment_table_lock);
+  return idx;
 }
 
 /* 在已映射的段内、按偏移定位一个 svm_msg_q（VPP 拥有，app 只 attach 引用） */
 int
 vcl2_segment_attach_mq (u64 handle, uword offset, u32 idx, svm_msg_q_t ** mq)
 {
+  vcl2_main_t *vm = &vcl2_main;
   fifo_segment_t *fs;
-  u32 fi;
+  uword *p;
 
-  fi = vcl2_segment_lookup (handle);
-  if (fi == VCL2_INVALID_SEG_INDEX)
+  clib_rwlock_reader_lock (&vm->segment_table_lock);
+  p = hash_get (vm->segment_table, handle);
+  if (!p)
     {
+      clib_rwlock_reader_unlock (&vm->segment_table_lock);
       VCL2_DBG ("attach_mq: segment %lu not attached", (unsigned long) handle);
       return -1;
     }
-  fs = fifo_segment_get_segment (&vcl2_main.segment_main, fi);
+  fs = fifo_segment_get_segment (&vm->segment_main, p[0]);
   *mq = fifo_segment_msg_q_attach (fs, offset, idx);
+  clib_rwlock_reader_unlock (&vm->segment_table_lock);
   if (!*mq)
     return -1;
   return 0;
@@ -76,15 +95,21 @@ vcl2_segment_attach_mq (u64 handle, uword offset, u32 idx, svm_msg_q_t ** mq)
 svm_fifo_t *
 vcl2_segment_alloc_fifo (u64 handle, uword offset)
 {
+  vcl2_main_t *vm = &vcl2_main;
   fifo_segment_t *fs;
-  u32 fi;
+  uword *p;
+  svm_fifo_t *f;
 
-  fi = vcl2_segment_lookup (handle);
-  if (fi == VCL2_INVALID_SEG_INDEX)
+  clib_rwlock_reader_lock (&vm->segment_table_lock);
+  p = hash_get (vm->segment_table, handle);
+  if (!p)
     {
+      clib_rwlock_reader_unlock (&vm->segment_table_lock);
       VCL2_DBG ("alloc_fifo: segment %lu not attached", (unsigned long) handle);
       return 0;
     }
-  fs = fifo_segment_get_segment (&vcl2_main.segment_main, fi);
-  return fifo_segment_alloc_fifo_w_offset (fs, offset);
+  fs = fifo_segment_get_segment (&vm->segment_main, p[0]);
+  f = fifo_segment_alloc_fifo_w_offset (fs, offset);
+  clib_rwlock_reader_unlock (&vm->segment_table_lock);
+  return f;
 }

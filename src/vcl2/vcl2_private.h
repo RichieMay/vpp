@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <vppinfra/hash.h>
 #include <vppinfra/vec.h>
+#include <vppinfra/lock.h>
 #include <vppinfra/socket.h>
 #include <svm/fifo_segment.h>
 #include <svm/message_queue.h>
@@ -146,7 +147,12 @@ typedef struct
 
   /* 状态 */
   uint8_t is_init;
-  pthread_mutex_t lock;
+  /* 多线程锁（方案 C：单一共享 worker + 锁）。所有被锁结构都是【可丢弃缓存】，
+   * 非跨进程资源 —— 单侧所有权不变。
+   *  - segment_table_lock：保护 segment_table hash + segment_main（段映射）
+   *  - sessions_lock：保护 sessions vec + handle_to_session hash（session 缓存） */
+  clib_rwlock_t segment_table_lock;
+  clib_rwlock_t sessions_lock;
 } vcl2_main_t;
 
 extern vcl2_main_t vcl2_main;

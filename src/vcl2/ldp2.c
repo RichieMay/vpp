@@ -189,17 +189,23 @@ ldp2_ctor (void)
 }
 
 /* ---------- fd 分类 ---------- */
-/* 合成 fd = fd_base + handle。仅当 handle 在 session 缓存里（已 create）才算 vcl2 fd。 */
+/* 合成 fd = fd_base + handle。仅当 handle 在 session 缓存里（已 create）才算 vcl2 fd。
+ * 多线程：hash 查询需 sessions 读锁（与 alloc/close 的 hash 写并发安全）。fd<base 直接
+ * 返回（真低 fd 不可能是 vcl2），不取锁。 */
 static inline int
 ldp2_fd_is_vcl2 (int fd)
 {
   vcl2_handle_t h;
+  int is_vcl2;
   if (!vcl2_is_init ())
     return 0;
   if (fd < (int) vcl2_main.fd_base)
     return 0;
   h = vcl2_fd_to_handle (fd);
-  return vcl2_session_get (h) != 0;
+  clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
+  is_vcl2 = vcl2_session_get (h) != 0;
+  clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
+  return is_vcl2;
 }
 
 /* 前向声明（epoll 实现在 close() 之后） */
@@ -599,13 +605,15 @@ ldp2_session_ready (vcl2_session_t * s, uint32_t want)
   return ev;
 }
 
-/* 扫描 epoll 上所有 vcl2 fd 注册，把就绪的填进 events[]。返回新增数。 */
+/* 扫描 epoll 上所有 vcl2 fd 注册，把就绪的填进 events[]。返回新增数。
+ * 持 sessions 读锁扫描（get/session_ready 用 session 指针；锁内指针稳定）。 */
 static int
 ldp2_ep_collect_vcl2 (ldp2_ep_t * ep, struct epoll_event *events, int maxevents,
 		      int off)
 {
   int n = off;
   u32 h;
+  clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
   for (h = 0; h < vec_len (ep->regs) && n < maxevents; h++)
     {
       ldp2_evr_t *r = &ep->regs[h];
@@ -625,6 +633,7 @@ ldp2_ep_collect_vcl2 (ldp2_ep_t * ep, struct epoll_event *events, int maxevents,
 	  n++;
 	}
     }
+  clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
   return n;
 }
 
@@ -765,9 +774,12 @@ bind (int fd, const struct sockaddr *addr, socklen_t len)
   ldp2_init_check ();
   if (ldp2_fd_is_vcl2 (fd) && addr)
     {
+      /* 写锁：存 lcl 地址进 session（mutate） */
+      clib_rwlock_writer_lock (&vcl2_main.sessions_lock);
       vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
       if (!s)
 	{
+	  clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
 	  errno = EBADF;
 	  return -1;
 	}
@@ -786,8 +798,7 @@ bind (int fd, const struct sockaddr *addr, socklen_t len)
 	  memcpy (s->lcl_ip, &a->sin6_addr, 16);
 	  s->lcl_port = ntohs (a->sin6_port);
 	}
-      LDP2_DBG ("bind fd=%d -> %u.%u.%u.%u:%u", fd, s->lcl_ip[0], s->lcl_ip[1],
-		s->lcl_ip[2], s->lcl_ip[3], s->lcl_port);
+      clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
       return 0;
     }
   return libc_bind (fd, addr, len);
@@ -829,9 +840,11 @@ ldp2_accept_common (int fd, struct sockaddr *addr, socklen_t * addrlen,
       errno = -rv;
       return -1;
     }
-  /* 回填对端 sockaddr（nginx 等读 accept 返回的 peer addr；不填则拿到栈垃圾 → 连接被关） */
+  /* 回填对端 sockaddr（nginx 等读 accept 返回的 peer addr；不填则拿到栈垃圾 → 连接被关）。
+   * 读锁：取子 session 的 rmt 地址（读 session 字段）。 */
   if (addr && addrlen)
     {
+      clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
       vcl2_session_t *cs = vcl2_session_get ((vcl2_handle_t) nh);
       if (cs && cs->rmt_is_ip4 && *addrlen >= (socklen_t) sizeof (struct sockaddr_in))
 	{
@@ -853,6 +866,7 @@ ldp2_accept_common (int fd, struct sockaddr *addr, socklen_t * addrlen,
 	  memcpy (addr, &a6, sizeof (a6));
 	  *addrlen = sizeof (a6);
 	}
+      clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
     }
   (void) flags;
   return vcl2_handle_to_fd (nh);
@@ -917,11 +931,26 @@ fcntl (int fd, int cmd, ...)
   ldp2_init_check ();
   if (ldp2_fd_is_vcl2 (fd))
     {
-      vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
-      if (cmd == F_SETFL && s)
-	s->nonblocking = (argval & O_NONBLOCK) ? 1 : 0;
-      if (cmd == F_GETFL && s)
-	return O_RDWR | (s->nonblocking ? O_NONBLOCK : 0);
+      vcl2_handle_t h = vcl2_fd_to_handle (fd);
+      if (cmd == F_SETFL)
+	{
+	  clib_rwlock_writer_lock (&vcl2_main.sessions_lock);
+	  vcl2_session_t *s = vcl2_session_get (h);
+	  if (s)
+	    s->nonblocking = (argval & O_NONBLOCK) ? 1 : 0;
+	  clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
+	  return 0;
+	}
+      if (cmd == F_GETFL)
+	{
+	  int nb = 0;
+	  clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
+	  vcl2_session_t *s = vcl2_session_get (h);
+	  if (s)
+	    nb = s->nonblocking;
+	  clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
+	  return O_RDWR | (nb ? O_NONBLOCK : 0);
+	}
       return 0;
     }
   return libc_fcntl (fd, cmd, arg);
@@ -941,11 +970,15 @@ ioctl (int fd, unsigned long cmd, ...)
   ldp2_init_check ();
   if (ldp2_fd_is_vcl2 (fd))
     {
-      vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
-      if (cmd == FIONBIO && s && arg)
+      if (cmd == FIONBIO && arg)
 	{
 	  iarg = (int *) arg;
-	  s->nonblocking = *iarg ? 1 : 0;
+	  int nb = *iarg ? 1 : 0;
+	  clib_rwlock_writer_lock (&vcl2_main.sessions_lock);
+	  vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
+	  if (s)
+	    s->nonblocking = nb;
+	  clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
 	}
       return 0;
     }
@@ -1008,19 +1041,12 @@ getpeername (int fd, struct sockaddr *addr, socklen_t * len)
  * 无就绪则阻塞在 eventfd 上（带真 fd 一起 poll），醒来重查。
  */
 
-/* 把 vcl2 fd 的就绪位填进 pollfd->revents。返回该 fd 是否就绪。 */
+/* 把 vcl2 fd 的就绪位填进 pollfd->revents。要求调用者持有 sessions 读锁；s 非 NULL。 */
 static int
-ldp2_poll_mark_vcl2 (struct pollfd *pfd)
+ldp2_poll_mark (vcl2_session_t * s, struct pollfd *pfd)
 {
-  vcl2_session_t *s;
   uint32_t want = 0, ev;
   pfd->revents = 0;
-  s = vcl2_session_get (vcl2_fd_to_handle (pfd->fd));
-  if (!s)
-    {
-      pfd->revents = POLLNVAL;	/* vcl2 fd 但无 session */
-      return 1;
-    }
   if (pfd->events & POLLIN)
     want |= EPOLLIN;
   if (pfd->events & POLLOUT)
@@ -1037,62 +1063,63 @@ int
 poll (struct pollfd *fds, nfds_t nfds, int timeout)
 {
   int efd, has_vcl2 = 0, n, slice;
-  nfds_t i;
+  nfds_t i, nr;
   struct pollfd *rp = 0;
   int *map = 0;
-  nfds_t nr = 0;
 
   ldp2_init_check ();
+  /* 快判是否含 vcl2 候选（fd>=base）；精确性由 get 在锁内确认 */
   for (i = 0; i < nfds; i++)
     {
       fds[i].revents = 0;
-      if (ldp2_fd_is_vcl2 (fds[i].fd))
+      if (fds[i].fd >= (int) vcl2_main.fd_base)
 	has_vcl2 = 1;
     }
   if (!has_vcl2)
     return libc_poll (fds, nfds, timeout);
 
   efd = ldp2_app_evt_fd ();
+  vec_validate (rp, nfds);		/* 最多 nfds 个真 fd */
+  vec_validate (map, nfds);
   for (;;)
     {
       vcl2_dispatch_app_events ();
       n = 0;
       nr = 0;
+      /* 读锁内：get 区分 vcl2 vs 真 fd；vcl2 标就绪，真 fd 收集到 rp/map */
+      clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
       for (i = 0; i < nfds; i++)
 	{
-	  if (ldp2_fd_is_vcl2 (fds[i].fd))
+	  vcl2_session_t *s = (fds[i].fd >= (int) vcl2_main.fd_base) ?
+	    vcl2_session_get (vcl2_fd_to_handle (fds[i].fd)) : 0;
+	  if (s)
 	    {
-	      if (ldp2_poll_mark_vcl2 (&fds[i]))
+	      if (ldp2_poll_mark (s, &fds[i]))
 		n++;
 	    }
 	  else
-	    nr++;		/* 真 fd，收集起来交给 libc */
+	    {
+	      fds[i].revents = 0;
+	      if (fds[i].fd >= 0)
+		{
+		  rp[nr] = fds[i];
+		  rp[nr].revents = 0;
+		  map[nr] = i;
+		  nr++;
+		}
+	    }
 	}
+      clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
       if (nr > 0)
 	{
-	  /* 非阻塞查真 fd，结果合并回 fds[] */
-	  vec_validate (rp, nr - 1);
-	  vec_validate (map, nr - 1);
-	  nr = 0;
-	  for (i = 0; i < nfds; i++)
-	    if (!ldp2_fd_is_vcl2 (fds[i].fd) && fds[i].fd >= 0)
-	      {
-		rp[nr] = fds[i];
-		rp[nr].revents = 0;
-		map[nr] = i;
-		nr++;
-	      }
-	  if (nr)
+	  int rn = libc_poll (rp, nr, 0);	/* 非阻塞查真 fd */
+	  for (i = 0; i < nr; i++)
 	    {
-	      int rn = libc_poll (rp, nr, 0);
-	      for (i = 0; i < nr; i++)
-		{
-		  fds[map[i]].revents = rp[i].revents;
-		  if (rp[i].revents)
-		    n++;
-		}
-	      (void) rn;
+	      fds[map[i]].revents = rp[i].revents;
+	      if (rp[i].revents)
+		n++;
 	    }
+	  (void) rn;
 	}
       if (n > 0 || timeout == 0)
 	{
@@ -1100,13 +1127,11 @@ poll (struct pollfd *fds, nfds_t nfds, int timeout)
 	  vec_free (map);
 	  return n;
 	}
-      /* 无就绪：阻塞。把 eventfd + 真 fd 一起 poll 一个时间片 */
+      /* 无就绪：阻塞一个 slice（不持锁） */
       if (efd >= 0)
 	{
 	  struct pollfd ep[1] = { {.fd = efd,.events = POLLIN,.revents = 0} };
 	  slice = (timeout < 0 || timeout > 100) ? 100 : timeout;
-	  /* 真 fd 也想被及时唤醒 → 一并 poll（它们已在 fds 里，但含 vcl2 fd 会绕路；
-	   * 简化：只 poll eventfd，真 fd 每 slice 由上面非阻塞查一次） */
 	  libc_poll (ep, 1, slice);
 	  if (ep[0].revents & POLLIN)
 	    {
@@ -1115,7 +1140,10 @@ poll (struct pollfd *fds, nfds_t nfds, int timeout)
 	    }
 	}
       else
-	usleep (10000);
+	{
+	  usleep (10000);
+	  slice = 10;
+	}
       if (timeout > 0)
 	{
 	  timeout -= slice;
@@ -1140,11 +1168,12 @@ select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
   struct timeval tv0 = { 0, 0 };
 
   ldp2_init_check ();
+  /* 快判是否含 vcl2 候选 */
   for (fd = 0; fd < nfds; fd++)
     {
       int wr = rset && FD_ISSET (fd, rset);
       int ww = wset && FD_ISSET (fd, wset);
-      if ((wr || ww) && ldp2_fd_is_vcl2 (fd))
+      if ((wr || ww) && fd >= (int) vcl2_main.fd_base)
 	has_vcl2 = 1;
     }
   if (!has_vcl2)
@@ -1153,48 +1182,52 @@ select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
   timeout_ms = timeout ? (timeout->tv_sec * 1000 + timeout->tv_usec / 1000) : -1;
   for (;;)
     {
+      fd_set tr, tw;
+      int maxr = -1;
+      int slice;
       vcl2_dispatch_app_events ();
       FD_ZERO (&orset);
       FD_ZERO (&owset);
+      FD_ZERO (&tr);
+      FD_ZERO (&tw);
       n = 0;
+      /* 读锁内：get 区分 vcl2 vs 真 fd；vcl2 查就绪，真 fd 收集到 tr/tw */
+      clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
       for (fd = 0; fd < nfds; fd++)
 	{
-	  if (!ldp2_fd_is_vcl2 (fd))
+	  int wr = rset && FD_ISSET (fd, rset);
+	  int ww = wset && FD_ISSET (fd, wset);
+	  if (!wr && !ww)
 	    continue;
-	  vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
-	  if (!s)
-	    continue;
-	  uint32_t want = 0;
-	  if (rset && FD_ISSET (fd, rset))
-	    want |= EPOLLIN;
-	  if (wset && FD_ISSET (fd, wset))
-	    want |= EPOLLOUT;
-	  uint32_t ev = ldp2_session_ready (s, want);
-	  if ((ev & EPOLLIN) && rset)
-	    { FD_SET (fd, &orset); n++; }
-	  if ((ev & EPOLLOUT) && wset)
-	    { FD_SET (fd, &owset); n++; }
+	  vcl2_session_t *s = (fd >= (int) vcl2_main.fd_base) ?
+	    vcl2_session_get (vcl2_fd_to_handle (fd)) : 0;
+	  if (s)
+	    {
+	      uint32_t want = 0;
+	      if (wr)
+		want |= EPOLLIN;
+	      if (ww)
+		want |= EPOLLOUT;
+	      uint32_t ev = ldp2_session_ready (s, want);
+	      if ((ev & EPOLLIN) && rset)
+		{ FD_SET (fd, &orset); n++; }
+	      if ((ev & EPOLLOUT) && wset)
+		{ FD_SET (fd, &owset); n++; }
+	    }
+	  else
+	    {
+	      if (wr)
+		FD_SET (fd, &tr);
+	      if (ww)
+		FD_SET (fd, &tw);
+	      if (fd > maxr)
+		maxr = fd;
+	    }
 	}
-      /* 真 fd 非阻塞查一次（0 timeout） */
-      int maxr = -1;
-      for (fd = 0; fd < nfds; fd++)
-	if (!ldp2_fd_is_vcl2 (fd) &&
-	    ((rset && FD_ISSET (fd, rset)) || (wset && FD_ISSET (fd, wset))))
-	  maxr = fd;
+      clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
       if (maxr >= 0)
 	{
-	  fd_set tr, tw;
-	  FD_ZERO (&tr);
-	  FD_ZERO (&tw);
-	  for (fd = 0; fd < nfds; fd++)
-	    if (!ldp2_fd_is_vcl2 (fd))
-	      {
-		if (rset && FD_ISSET (fd, rset))
-		  FD_SET (fd, &tr);
-		if (wset && FD_ISSET (fd, wset))
-		  FD_SET (fd, &tw);
-	      }
-	  int rn = libc_select (maxr + 1, &tr, &tw, 0, &tv0);
+	  int rn = libc_select (maxr + 1, &tr, &tw, 0, &tv0);	/* 非阻塞查真 fd */
 	  (void) rn;
 	  for (fd = 0; fd <= maxr; fd++)
 	    {
@@ -1207,27 +1240,42 @@ select (int nfds, fd_set * rset, fd_set * wset, fd_set * eset,
       if (n > 0 || (timeout && timeout->tv_sec == 0 && timeout->tv_usec == 0))
 	{
 	  if (rset)
-		*rset = orset;
+	    *rset = orset;
 	  if (wset)
-		*wset = owset;
+	    *wset = owset;
 	  if (eset)
-		FD_ZERO (eset);
+	    FD_ZERO (eset);
 	  return n;
 	}
-      /* 阻塞一个 slice */
+      /* 阻塞一个 slice（不持锁） */
       int efd = ldp2_app_evt_fd ();
       if (efd >= 0)
 	{
 	  struct pollfd ep[1] = { {.fd = efd,.events = POLLIN,.revents = 0} };
-	  int slice = (timeout_ms < 0 || timeout_ms > 100) ? 100 : timeout_ms;
+	  slice = (timeout_ms < 0 || timeout_ms > 100) ? 100 : timeout_ms;
 	  libc_poll (ep, 1, slice);
 	  if (ep[0].revents & POLLIN)
 	    { uint64_t b; read (efd, &b, sizeof (b)); }
-	  if (timeout_ms >= 0)
-	    { timeout_ms -= slice; if (timeout_ms <= 0) { if(rset)*rset=orset; if(wset)*wset=owset; if(eset)FD_ZERO(eset); return 0; } }
 	}
       else
-	usleep (10000);
+	{
+	  usleep (10000);
+	  slice = 10;
+	}
+      if (timeout_ms >= 0)
+	{
+	  timeout_ms -= slice;
+	  if (timeout_ms <= 0)
+	    {
+	      if (rset)
+		*rset = orset;
+	      if (wset)
+		*wset = owset;
+	      if (eset)
+		FD_ZERO (eset);
+	      return 0;
+	    }
+	}
     }
 }
 
