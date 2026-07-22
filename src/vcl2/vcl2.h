@@ -77,10 +77,6 @@ int vcl2_session_accept (vcl2_handle_t listener_sh, vcl2_handle_t *accepted_sh);
 int vcl2_session_connect (vcl2_handle_t sh, uint8_t is_ip4, const uint8_t * ip,
 			  uint16_t port);
 
-/* 从 app_event_queue 读一个事件（事件由 VPP 投递、VPP-owned 段内）。
- * timeout_s<=0 非阻塞轮询。返回 event_type(>0) / 0(无) / 负 errno。 */
-int vcl2_event_poll_once (double timeout_s);
-
 int vcl2_session_send (vcl2_handle_t sh, const void *buf, uint32_t len);
 int vcl2_session_recv (vcl2_handle_t sh, void *buf, uint32_t len);
 int vcl2_session_close (vcl2_handle_t sh);

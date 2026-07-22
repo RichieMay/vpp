@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 #include <arpa/inet.h>		/* htons */
 
 #include <vppinfra/clib_error.h>
@@ -157,27 +158,6 @@ vcl2_session_attach_connected (vcl2_session_t * s, session_connected_msg_t * cm)
   return 0;
 }
 
-int
-vcl2_event_poll_once (double timeout_s)
-{
-  vcl2_main_t *vm = &vcl2_main;
-  svm_msg_q_msg_t msg;
-  session_event_t *e;
-  int et;
-
-  if (!vm->app_event_queue)
-    return -ENOTCONN;
-  if (svm_msg_q_timedwait (vm->app_event_queue, timeout_s))
-    return 0;
-  if (svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
-    return 0;
-  e = svm_msg_q_msg_data (vm->app_event_queue, &msg);
-  et = e->event_type;
-  VCL2_DBG ("event received: type=%u", et);
-  svm_msg_q_free_msg (vm->app_event_queue, &msg);
-  return et;
-}
-
 /*
  * connect：发 CONNECT，阻塞等 CONNECTED。等待时不持锁；每轮重取。
  */
@@ -215,52 +195,42 @@ vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t * ip,
     }
   app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &app_evt);
 
-  /* 事件驱动等 CONNECTED：deadline 限定（VCL2_CTRL_TIMEOUT），每次唤醒彻底排空找目标。
-   * CONNECTED 经 eventfd 即时到达，无短分片。*/
+  /* 事件驱动等 CONNECTED：dispatch 统一处理所有事件类型（含 CONNECTED，置 ctrl_done），
+   * 本循环只检测标志——不再内联 drain 丢弃其它事件。deadline 限定 + 1ms 有界重查。*/
   {
-    struct timespec t0;
-    long deadline_ms;
+    struct timespec t0, now;
+    long deadline_ms, now_ms;
+    double rem;
     clock_gettime (CLOCK_MONOTONIC, &t0);
     deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 +
 		  (long) (VCL2_CTRL_TIMEOUT * 1000);
     for (;;)
       {
-	struct timespec now;
-	long now_ms;
-	double rem;
-	svm_msg_q_msg_t msg;
-	session_event_t *e;
+	uint8_t done;
+	int rv;
+	clib_rwlock_reader_lock (&vm->sessions_lock);
+	vcl2_session_t *s = vcl2_session_get (h);
+	done = s ? s->ctrl_done : 0;
+	rv = s ? s->ctrl_rv : -EINVAL;
+	clib_rwlock_reader_unlock (&vm->sessions_lock);
+	if (done)
+	  {
+	    /* 清标志（防复用；connect 每 session 一次，清掉无副作用）*/
+	    clib_rwlock_writer_lock (&vm->sessions_lock);
+	    s = vcl2_session_get (h);
+	    if (s)
+	      s->ctrl_done = 0;
+	    clib_rwlock_writer_unlock (&vm->sessions_lock);
+	    return rv;
+	  }
 	clock_gettime (CLOCK_MONOTONIC, &now);
 	now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
 	if (now_ms >= deadline_ms)
 	  return -ETIMEDOUT;
 	rem = (double) (deadline_ms - now_ms) / 1000.0;
-	if (svm_msg_q_timedwait (vm->app_event_queue, rem))
-	  continue;
-	while (!svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
-	  {
-	    e = svm_msg_q_msg_data (vm->app_event_queue, &msg);
-	    et = e->event_type;
-	    if (et == SESSION_CTRL_EVT_CONNECTED)
-	      {
-		int crv;
-		session_connected_msg_t *cm = (session_connected_msg_t *) e->data;
-		svm_msg_q_free_msg (vm->app_event_queue, &msg);
-		if (cm->retval)
-		  return (int) cm->retval;
-		/* 成功：写锁内 get-or-alloc + attach fifos */
-		clib_rwlock_writer_lock (&vm->sessions_lock);
-		vcl2_session_t *s = vcl2_session_get (h);
-		if (!s)
-		  s = vcl2_session_alloc (h);
-		crv = s ? vcl2_session_attach_connected (s, cm) : -ENOMEM;
-		clib_rwlock_writer_unlock (&vm->sessions_lock);
-		return crv;
-	      }
-	    svm_msg_q_free_msg (vm->app_event_queue, &msg);
-	    if (et < 0)
-	      return et;
-	  }
+	if (rem > 0.001)
+	  rem = 0.001;		/* cap 1ms 有界重查 */
+	vcl2_mq_wait_dispatch (rem);
       }
   }
 }
@@ -310,12 +280,11 @@ vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len)
 	  clib_rwlock_reader_unlock (&vm->sessions_lock);
 	  return n < 0 ? -EAGAIN : n;
 	}
-      /* 无空间：arm want-deq-ntf，解锁后【事件驱动】等——VPP 在 tx 空间释放时 signal
-       * eventfd，timedwait 即时唤醒。无短分片。*/
+      /* 无空间：arm want-deq-ntf，解锁后 1ms 有界重查等（app_mq_lock 内）。MT 下与
+       * recv 同理：主线程可能偷 eventfd，1ms 兜底重看 tx 空间。顺带排空分发。*/
       svm_fifo_add_want_deq_ntf (s->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
       clib_rwlock_reader_unlock (&vm->sessions_lock);
-      svm_msg_q_timedwait (vm->app_event_queue, VCL2_BLOCK_TIMEOUT);
-      vcl2_dispatch_app_events ();
+      vcl2_mq_wait_dispatch (0.001);
     }
   return -EAGAIN;			/* not reached */
 }
@@ -354,10 +323,10 @@ vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len)
 	return 0;
       if (nb)
 	return -EAGAIN;		/* 非阻塞 + 空：立即 EAGAIN */
-      /* 【事件驱动】阻塞：VPP 在 RX 入队时 signal eventfd（无条件），timedwait 即时
-       * 唤醒。无短分片、无忙等。peer 死→DISCONNECTED→dispatch 置 peer_closed→下一轮 EOF。*/
-      svm_msg_q_timedwait (vm->app_event_queue, VCL2_BLOCK_TIMEOUT);
-      vcl2_dispatch_app_events ();
+      /* 阻塞：app_mq_lock 内 1ms 有界重查 + 排空，锁外分发。MT 下主线程 select 共享
+       * eventfd 会偷信号，1ms 重查保证 worker 至多 1ms 重看 fifo（对齐 VCL vcl_worker_wait_mq）。
+       * peer 死→DISCONNECTED→process 置 peer_closed→下一轮 EOF。*/
+      vcl2_mq_wait_dispatch (0.001);
     }
   return -ETIMEDOUT;			/* not reached */
 }
@@ -379,35 +348,9 @@ vcl2_session_close (vcl2_handle_t h)
     }
   VCL2_DBG ("close handle=%u vpp=0x%llx%s", s->handle,
 	   (unsigned long long) s->vpp_handle, s->is_listener ? " (listener)" : "");
-  if (s->is_listener)
-    {
-      if (vm->ctrl_mq)
-	{
-	  app_session_evt_t ae;
-	  session_unlisten_msg_t *mp;
-	  app_alloc_ctrl_evt_to_vpp (vm->ctrl_mq, &ae, SESSION_CTRL_EVT_UNLISTEN);
-	  mp = (session_unlisten_msg_t *) ae.evt->data;
-	  memset (mp, 0, sizeof (*mp));
-	  mp->client_index = vm->api_client_handle;
-	  mp->context = h;
-	  mp->wrk_index = vm->app_wrk_index;
-	  mp->handle = s->vpp_handle;
-	  app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &ae);
-	}
-    }
-  else if (s->vpp_handle && vm->vpp_evt_q)
-    {
-      app_session_evt_t ae;
-      session_disconnect_msg_t *mp;
-      app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae, SESSION_CTRL_EVT_DISCONNECT);
-      mp = (session_disconnect_msg_t *) ae.evt->data;
-      memset (mp, 0, sizeof (*mp));
-      mp->client_index = vm->api_client_handle;
-      mp->handle = s->vpp_handle;
-      app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
-      VCL2_DBG ("DISCONNECT sent handle=%u vpp=0x%llx", h,
-	       (unsigned long long) s->vpp_handle);
-    }
+  /* 锁内只取发送所需字段 + 清缓存；解锁后再发 ctrl（避免 send 阻塞时长期持写锁）*/
+  uint8_t is_listener = s->is_listener;
+  uint64_t vpp_handle = s->vpp_handle;
   hash_unset (vm->handle_to_session, (uword) h);
   vec_free (s->accept_q);
   s->in_use = 0;
@@ -415,6 +358,33 @@ vcl2_session_close (vcl2_handle_t h)
   s->is_listener = 0;
   s->vpp_handle = 0;
   clib_rwlock_writer_unlock (&vm->sessions_lock);
+
+  if (is_listener && vm->ctrl_mq)
+    {
+      app_session_evt_t ae;
+      session_unlisten_msg_t *mp;
+      app_alloc_ctrl_evt_to_vpp (vm->ctrl_mq, &ae, SESSION_CTRL_EVT_UNLISTEN);
+      mp = (session_unlisten_msg_t *) ae.evt->data;
+      memset (mp, 0, sizeof (*mp));
+      mp->client_index = vm->api_client_handle;
+      mp->context = h;
+      mp->wrk_index = vm->app_wrk_index;
+      mp->handle = vpp_handle;
+      app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &ae);
+    }
+  else if (!is_listener && vpp_handle && vm->vpp_evt_q)
+    {
+      app_session_evt_t ae;
+      session_disconnect_msg_t *mp;
+      app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae, SESSION_CTRL_EVT_DISCONNECT);
+      mp = (session_disconnect_msg_t *) ae.evt->data;
+      memset (mp, 0, sizeof (*mp));
+      mp->client_index = vm->api_client_handle;
+      mp->handle = vpp_handle;
+      app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+      VCL2_DBG ("DISCONNECT sent handle=%u vpp=0x%llx", h,
+	       (unsigned long long) vpp_handle);
+    }
   return 0;
 }
 
@@ -466,11 +436,17 @@ int
 vcl2_session_unlisten (vcl2_handle_t h)
 {
   vcl2_main_t *vm = &vcl2_main;
-  int rv = -EINVAL;
+  uint8_t is_listener;
+  uint64_t vpp_handle;
 
+  /* 锁内取字段，解锁后再发 ctrl（避免 send 阻塞持写锁）*/
   clib_rwlock_writer_lock (&vm->sessions_lock);
   vcl2_session_t *s = vcl2_session_get (h);
-  if (s && s->is_listener && vm->ctrl_mq)
+  is_listener = s && s->is_listener;
+  vpp_handle = s ? s->vpp_handle : 0;
+  clib_rwlock_writer_unlock (&vm->sessions_lock);
+
+  if (is_listener && vm->ctrl_mq)
     {
       app_session_evt_t ae;
       session_unlisten_msg_t *mp;
@@ -480,12 +456,11 @@ vcl2_session_unlisten (vcl2_handle_t h)
       mp->client_index = vm->api_client_handle;
       mp->context = h;
       mp->wrk_index = vm->app_wrk_index;
-      mp->handle = s->vpp_handle;
+      mp->handle = vpp_handle;
       app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &ae);
-      rv = 0;
+      return 0;
     }
-  clib_rwlock_writer_unlock (&vm->sessions_lock);
-  return rv;
+  return -EINVAL;
 }
 
 /*
@@ -539,48 +514,41 @@ vcl2_session_listen (vcl2_handle_t h, uint32_t q_len)
     clib_memcpy_fast (&mp->ip, lcl_ip, 16);
   app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &app_evt);
 
-  /* 事件驱动等 BOUND：deadline 限定，每次唤醒彻底排空找目标。经 eventfd 即时到达。*/
+  /* 事件驱动等 BOUND：dispatch 统一处理（含 BOUND，置 ctrl_done + listener 身份），
+   * 本循环只检测标志。deadline 限定 + 1ms 有界重查。*/
   {
-    struct timespec t0;
-    long deadline_ms;
+    struct timespec t0, now;
+    long deadline_ms, now_ms;
+    double rem;
     clock_gettime (CLOCK_MONOTONIC, &t0);
     deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 +
 		  (long) (VCL2_CTRL_TIMEOUT * 1000);
     for (;;)
       {
-	struct timespec now;
-	long now_ms;
-	double rem;
-	svm_msg_q_msg_t msg;
-	session_event_t *e;
+	uint8_t done;
+	int rv;
+	clib_rwlock_reader_lock (&vm->sessions_lock);
+	vcl2_session_t *s = vcl2_session_get (h);
+	done = s ? s->ctrl_done : 0;
+	rv = s ? s->ctrl_rv : -EINVAL;
+	clib_rwlock_reader_unlock (&vm->sessions_lock);
+	if (done)
+	  {
+	    clib_rwlock_writer_lock (&vm->sessions_lock);
+	    s = vcl2_session_get (h);
+	    if (s)
+	      s->ctrl_done = 0;
+	    clib_rwlock_writer_unlock (&vm->sessions_lock);
+	    return rv;
+	  }
 	clock_gettime (CLOCK_MONOTONIC, &now);
 	now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
 	if (now_ms >= deadline_ms)
 	  return -ETIMEDOUT;
 	rem = (double) (deadline_ms - now_ms) / 1000.0;
-	if (svm_msg_q_timedwait (vm->app_event_queue, rem))
-	  continue;
-	while (!svm_msg_q_sub (vm->app_event_queue, &msg, SVM_Q_NOWAIT, 0))
-	  {
-	    e = svm_msg_q_msg_data (vm->app_event_queue, &msg);
-	    if (e->event_type == SESSION_CTRL_EVT_BOUND)
-	      {
-		session_bound_msg_t *bm = (session_bound_msg_t *) e->data;
-		svm_msg_q_free_msg (vm->app_event_queue, &msg);
-		if (bm->retval)
-		  return (int) bm->retval;
-		clib_rwlock_writer_lock (&vm->sessions_lock);
-		vcl2_session_t *ls = vcl2_session_get (h);
-		if (ls)
-		  {
-		    ls->vpp_handle = bm->handle;
-		    ls->is_listener = 1;
-		  }
-		clib_rwlock_writer_unlock (&vm->sessions_lock);
-		return ls ? 0 : -EINVAL;
-	      }
-	    svm_msg_q_free_msg (vm->app_event_queue, &msg);
-	  }
+	if (rem > 0.001)
+	  rem = 0.001;		/* cap 1ms 有界重查 */
+	vcl2_mq_wait_dispatch (rem);
       }
   }
 }
@@ -608,49 +576,70 @@ vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t * out)
   for (;;)
     {
       vcl2_handle_t ch = 0;
-      int got = 0;
-      clib_rwlock_writer_lock (&vm->sessions_lock);	/* pop accept_q + 回 reply */
+      int got = 0, have_cs = 0;
+      uint32_t accept_context = 0, cs_vpp_session_index = 0;
+      uint64_t cs_vpp_handle = 0;
+      clib_rwlock_writer_lock (&vm->sessions_lock);	/* pop accept_q，取子 session 字段 */
       s = vcl2_session_get (listener_h);
       if (s && vec_len (s->accept_q) > 0)
 	{
 	  ch = s->accept_q[0];
 	  vec_delete (s->accept_q, 1, 0);
 	  vcl2_session_t *cs = vcl2_session_get (ch);
-	  if (cs && vm->vpp_evt_q)
+	  if (cs)
 	    {
-	      app_session_evt_t ae;
-	      session_accepted_reply_msg_t *rm;
-	      app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae,
-					 SESSION_CTRL_EVT_ACCEPTED_REPLY);
-	      rm = (session_accepted_reply_msg_t *) ae.evt->data;
-	      rm->context = cs->accept_context;
-	      rm->retval = 0;
-	      rm->handle = cs->vpp_handle;
-	      rm->app_session_index = cs->vpp_session_index;
-	      app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+	      accept_context = cs->accept_context;
+	      cs_vpp_handle = cs->vpp_handle;
+	      cs_vpp_session_index = cs->vpp_session_index;
+	      have_cs = 1;
 	    }
 	  got = 1;
 	}
       clib_rwlock_writer_unlock (&vm->sessions_lock);
       if (got)
 	{
+	  /* 解锁后回 ACCEPTED_REPLY（避免 send 阻塞持写锁）*/
+	  if (have_cs && vm->vpp_evt_q)
+	    {
+	      app_session_evt_t ae;
+	      session_accepted_reply_msg_t *rm;
+	      app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae,
+					 SESSION_CTRL_EVT_ACCEPTED_REPLY);
+	      rm = (session_accepted_reply_msg_t *) ae.evt->data;
+	      rm->context = accept_context;
+	      rm->retval = 0;
+	      rm->handle = cs_vpp_handle;
+	      rm->app_session_index = cs_vpp_session_index;
+	      app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+	    }
 	  *out = ch;
 	  return 0;
 	}
-      /* 事件驱动等 ACCEPTED：经 eventfd 即时到达，dispatch 入 accept_q，下一轮 pop。*/
-      svm_msg_q_timedwait (vm->app_event_queue, VCL2_BLOCK_TIMEOUT);
-      vcl2_dispatch_app_events ();
+      /* 等 ACCEPTED：1ms 有界重查 + 排空（app_mq_lock 串行）。dispatch 入 accept_q，
+       * 下一轮 pop。*/
+      vcl2_mq_wait_dispatch (0.001);
     }
   return -EAGAIN;			/* not reached */
 }
 
 /*
- * dispatch：排空 app_event_queue（sub 原子）。ADD_SEGMENT→segment attach（内部 segment
- * 写锁）；DISCONNECTED→写锁设 peer_closed + 回 DISCONNECTED_REPLY；ACCEPTED→写锁内建子
- * session + attach fifos + 入 accept_q。
+ * mq 排空与分发（多线程串行化，A 修复）。
+ *
+ * timedwait(可选) 在 app_mq_lock【外】（仅 poll eventfd，不碰 mq 环）；app_mq_lock 内
+ * 只做排空(sub) + 就地处理。理由：若 timedwait 持锁，worker 在 1ms poll 期间独占比锁，
+ * 饿死主线程 select 的 dispatch（ctrl 事件如 end-of-test 处理不了→hang）。eventfd 已
+ * O_NONBLOCK，锁外 timedwait 的内部 read 不会阻塞。
+ * 就地处理含 sessions_lock(W)（DISCONNECTED/ACCEPTED/CONNECTED/BOUND）。死锁分析：经审查
+ * 【无任何路径在持有 sessions_lock 时获取 app_mq_lock】——所有数据/ctrl 路径都是先释放
+ * sessions_lock 再取 app_mq_lock。故锁序单向 app_mq_lock→sessions_lock，无环、无死锁。
+ *
+ * 关键：session_event_t 是【头部 + data[] 柔性数组】（payload 在 mq buffer 内紧跟头部，
+ * 见 session_types.h:476），故必须在 free_msg【前】就地读 payload——不可只拷贝 header
+ * 延后处理（否则 payload 随 free_msg 失效）。ADD_SEGMENT 的 sapi fd recv 亦须按 mq 全局
+ * 顺序，故同样就地。
  */
 void
-vcl2_dispatch_app_events (void)
+vcl2_mq_wait_dispatch (double timeout_s)
 {
   vcl2_main_t *vm = &vcl2_main;
   svm_msg_q_t *mq = vm->app_event_queue;
@@ -658,6 +647,9 @@ vcl2_dispatch_app_events (void)
 
   if (!mq)
     return;
+  pthread_mutex_lock (&vm->app_mq_lock);
+  if (timeout_s > 0)
+    svm_msg_q_timedwait (mq, timeout_s);
   while (!svm_msg_q_sub (mq, &msg, SVM_Q_NOWAIT, 0))
     {
       session_event_t *e = svm_msg_q_msg_data (mq, &msg);
@@ -737,6 +729,53 @@ vcl2_dispatch_app_events (void)
 		     (unsigned long long) am->listener_handle);
 	  clib_rwlock_writer_unlock (&vm->sessions_lock);
 	}
+      else if (e->event_type == SESSION_CTRL_EVT_CONNECTED)
+	{
+	  /* connect 回复：context = vcl2 handle（connect 请求所设）。attach fifos + 置
+	   * ctrl_done，让 vcl2_session_connect 的等待循环检测到并返回。*/
+	  session_connected_msg_t *cm = (session_connected_msg_t *) e->data;
+	  clib_rwlock_writer_lock (&vm->sessions_lock);
+	  vcl2_session_t *cs = vcl2_session_get (cm->context);
+	  if (cs)
+	    {
+	      if (cm->retval)
+		cs->ctrl_rv = (int) cm->retval;
+	      else
+		cs->ctrl_rv = vcl2_session_attach_connected (cs, cm);
+	      cs->ctrl_done = 1;
+	      VCL2_DBG ("CONNECTED handle=%u rv=%d", cs->handle, cs->ctrl_rv);
+	    }
+	  clib_rwlock_writer_unlock (&vm->sessions_lock);
+	}
+      else if (e->event_type == SESSION_CTRL_EVT_BOUND)
+	{
+	  /* listen 回复：context = vcl2 handle。置 listener 身份 + ctrl_done。*/
+	  session_bound_msg_t *bm = (session_bound_msg_t *) e->data;
+	  clib_rwlock_writer_lock (&vm->sessions_lock);
+	  vcl2_session_t *bs = vcl2_session_get (bm->context);
+	  if (bs)
+	    {
+	      if (bm->retval)
+		bs->ctrl_rv = (int) bm->retval;
+	      else
+		{
+		  bs->vpp_handle = bm->handle;
+		  bs->is_listener = 1;
+		  bs->ctrl_rv = 0;
+		}
+	      bs->ctrl_done = 1;
+	      VCL2_DBG ("BOUND handle=%u rv=%d", bs->handle, bs->ctrl_rv);
+	    }
+	  clib_rwlock_writer_unlock (&vm->sessions_lock);
+	}
       svm_msg_q_free_msg (mq, &msg);
     }
+  pthread_mutex_unlock (&vm->app_mq_lock);
+}
+
+/* 非阻塞排空 + 分发（ldp2 select/poll/epoll 唤醒后用）。无等待。*/
+void
+vcl2_dispatch_app_events (void)
+{
+  vcl2_mq_wait_dispatch (0);
 }

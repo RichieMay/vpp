@@ -177,7 +177,14 @@ vcl2_app_attach_locked (void)
 			      &vm->app_event_queue))
     return -EINVAL;
   if (rp->fd_flags & SESSION_FD_F_MQ_EVENTFD)
-    svm_msg_q_set_eventfd (vm->app_event_queue, fds[n++]);
+    {
+      svm_msg_q_set_eventfd (vm->app_event_queue, fds[n]);
+      /* eventfd 置非阻塞（对齐 VCL vcl_private.c:65）：否则多线程下主线程 select 的
+       * read(efd) 与 worker svm_msg_q_timedwait 的 read(evtfd) 竞争同一计数，一方取走
+       * 后另一方阻塞 read 永久挂起。svm_msg_q_timedwait 的 errno!=EAGAIN 分支专为非阻塞。*/
+      fcntl (fds[n], F_SETFL, O_NONBLOCK);
+      n++;
+    }
   /* VPP 控制 mq：session listen/connect 等请求经它 */
   if (vcl2_segment_attach_mq (VCL2_VPP_WRK_SEG_HANDLE (0), rp->vpp_ctrl_mq,
 			      rp->vpp_ctrl_mq_thread, &vm->ctrl_mq))
@@ -298,7 +305,11 @@ vcl2_worker_register_locked (void)
 			      0, &vm->app_event_queue))
     goto failed;
   if (rp->fd_flags & SESSION_FD_F_MQ_EVENTFD)
-    svm_msg_q_set_eventfd (vm->app_event_queue, fds[n++]);
+    {
+      svm_msg_q_set_eventfd (vm->app_event_queue, fds[n]);
+      fcntl (fds[n], F_SETFL, O_NONBLOCK);	/* 同 attach：eventfd 非阻塞（对齐 VCL）*/
+      n++;
+    }
 
   VCL2_DBG ("worker registered: wrk_index=%u client=%u seg=%lu app_eq=%p "
 	    "(n_fds=%u, used=%d)", vm->app_wrk_index, vm->api_client_handle,
@@ -469,6 +480,7 @@ vcl2_init (const char *app_name)
   memset (vm, 0, sizeof (*vm));
   clib_rwlock_init (&vm->segment_table_lock);
   clib_rwlock_init (&vm->sessions_lock);
+  pthread_mutex_init (&vm->app_mq_lock, NULL);
   vm->fd_base = VCL2_FD_BASE_DEFAULT;
   vm->app_name = strdup (app_name ? app_name : "vcl2_app");
   vm->pid = getpid ();
@@ -549,14 +561,13 @@ vcl2_destroy (void)
 
   /* 丢弃 app 侧可丢弃缓存（进程本地；即便不 free，进程退出内核也会回收）*/
   vec_free (vm->segments);
-  vec_free (vm->fd_cache);
   vec_free (vm->sessions);
-  hash_free (vm->handle_to_cache_index);
   hash_free (vm->handle_to_session);
   free (vm->app_name);
   free (vm->sapi_socket_path);
   clib_rwlock_free (&vm->segment_table_lock);
   clib_rwlock_free (&vm->sessions_lock);
+  pthread_mutex_destroy (&vm->app_mq_lock);
   memset (vm, 0, sizeof (*vm));
 }
 

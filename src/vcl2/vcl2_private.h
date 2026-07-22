@@ -67,16 +67,6 @@ typedef struct
 } vcl2_segment_t;
 
 /**
- * 可丢弃的 fd→handle 缓存条目。fork 后子进程丢弃重建（身份不继承）。
- */
-typedef struct
-{
-  vcl2_handle_t handle;
-  uint32_t seg_index;
-  uint8_t in_use;
-} vcl2_fd_cache_t;
-
-/**
  * 可丢弃的 session 缓存条目。
  *
  * 注意（单侧所有权）：这里【不】持有任何需要跨进程释放的资源——rx_fifo/tx_fifo
@@ -96,6 +86,10 @@ typedef struct
   uint8_t peer_closed;		/* 收到 DISCONNECTED：recv 排空后返回 0(EOF)，epoll/poll 报 EPOLLIN */
   uint8_t rd_shutdown;		/* shutdown(SHUT_RD/RDWR)：app 不再读，recv 返回 0(EOF) */
   uint8_t wr_shutdown;		/* shutdown(SHUT_WR/RDWR)：app 不再写，send 返回 -EPIPE；并已发 SHUTDOWN 给 VPP */
+  /* 控制面完成标志（dispatch 处理 CONNECTED/BOUND 后置位；connect/listen 轮询它）。
+   * 避免 connect/listen 内联 drain 丢弃其它事件——统一由 dispatch 处理全部类型。*/
+  uint8_t ctrl_done;		/* 0=等待中；1=CONNECTED/BOUND 已到（见 ctrl_rv） */
+  int ctrl_rv;			/* CONNECTED/BOUND 结果（retval 或 -errno） */
   /* server 侧（listen/accept） */
   uint8_t is_listener;		/* BOUND 后置位 */
   uint8_t lcl_is_ip4;		/* bind() 存的本地地址，listen() 用 */
@@ -142,8 +136,6 @@ typedef struct
 
   /* 数据面映射（VPP-owned，app 只 mmap） */
   vcl2_segment_t *segments;
-  vcl2_fd_cache_t *fd_cache;
-  uword *handle_to_cache_index;
 
   /* 状态 */
   uint8_t is_init;
@@ -153,6 +145,12 @@ typedef struct
    *  - sessions_lock：保护 sessions vec + handle_to_session hash（session 缓存） */
   clib_rwlock_t segment_table_lock;
   clib_rwlock_t sessions_lock;
+  /* 多线程 mq 串行化锁（对齐 VCL vls_mt_mq_mlock）：主线程 select/poll/epoll dispatch
+   * 与 worker 阻塞 recv/send/ctrl 共用同一 app_event_queue，并发 sub/timedwait 会竞态。
+   * 此 mutex 是 app_event_queue 的【唯一】守卫。
+   * 锁序不变量：app_mq_lock 与 sessions_lock【绝不】同时持有（drain 在 mq_lock 内、
+   * process 在 mq_lock 外取 sessions_lock）→ 无环、无死锁。*/
+  pthread_mutex_t app_mq_lock;
 } vcl2_main_t;
 
 extern vcl2_main_t vcl2_main;
@@ -186,7 +184,13 @@ int vcl2_session_attach_fifos (vcl2_session_t * s, u64 vpp_handle, u64 seg,
 			       uword rxf_off, uword txf_off, uword vpp_eq_off,
 			       u32 mq_index);
 /* 排空 app_event_queue 并按类型分发（ldp2 epoll_wait / accept 共用）。
- * ACCEPTED 事件建新 session 入对应 listener 的 accept_q。*/
+ * ACCEPTED 事件建新 session 入对应 listener 的 accept_q。
+ * 非阻塞：timedwait(0)，立即排空当前在队事件。*/
 void vcl2_dispatch_app_events (void);
+/* 阻塞"等+排空+分发"：app_mq_lock 内 timedwait(timeout)+drain，锁外 process。
+ * - 数据路径（recv/send）：timeout=0.001（1ms 有界重查，防丢唤醒）。
+ * - 非阻塞 drain：timeout=0。
+ * 锁序：mq_lock 与 sessions_lock 永不重叠。*/
+void vcl2_mq_wait_dispatch (double timeout_s);
 
 #endif /* included_vcl2_private_h */
