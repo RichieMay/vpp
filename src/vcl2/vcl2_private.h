@@ -113,6 +113,7 @@ typedef struct {
   /* 控制面：唯一控制通道（SAPI UDS, SOCK_SEQPACKET） */
   clib_socket_t sapi_sock;
   uint8_t sapi_connected;
+  pthread_mutex_t sapi_lock; /* 保护 sapi_sock 的 send/recv 配对（防并发乱序） */
   uint32_t app_index;     /* VPP 分配（attach reply） */
   uint32_t app_wrk_index; /* 当前进程 app-worker（worker-add reply） */
   uint32_t api_client_handle;
@@ -142,11 +143,9 @@ typedef struct {
    *  - sessions_lock：保护 sessions vec + handle_to_session hash（session 缓存） */
   clib_rwlock_t segment_table_lock;
   clib_rwlock_t sessions_lock;
-  /* 多线程 mq 串行化锁（对齐 VCL vls_mt_mq_mlock）：主线程 select/poll/epoll dispatch
-   * 与 worker 阻塞 recv/send/ctrl 共用同一 app_event_queue，并发 sub/timedwait 会竞态。
-   * 此 mutex 是 app_event_queue 的【唯一】守卫。
-   * 锁序不变量：app_mq_lock 与 sessions_lock【绝不】同时持有（drain 在 mq_lock 内、
-   * process 在 mq_lock 外取 sessions_lock）→ 无环、无死锁。*/
+  /* 多线程 mq 串行化锁：app_event_queue 的唯一守卫。
+   * 锁序：app_mq_lock（外）→ sessions_lock（内）。vcl2_mq_wait_dispatch 持 app_mq_lock
+   * 期间在 drain 分支取 sessions_lock(W)。单向锁序，无环、无死锁。 */
   pthread_mutex_t app_mq_lock;
 } vcl2_main_t;
 
@@ -162,10 +161,10 @@ extern vcl2_main_t vcl2_main;
 int vcl2_sapi_connect (void);
 int vcl2_app_attach_locked (void);
 int vcl2_worker_register_locked (void);
-int vcl2_sapi_recv_fd (
-  int *fd); /* recvmsg 一个 SCM_RIGHTS fd（ADD_SEGMENT 用）*/
-void vcl2_atfork_child (
-  void); /* fork 子进程：重建 worker 身份（nginx 多 worker）*/
+int vcl2_sapi_recv_fd (int *fd);
+void vcl2_atfork_prepare (void); /* fork 前：acquire 所有锁，保证 child 继承干净状态 */
+void vcl2_atfork_parent (void);  /* fork 后父进程：释放锁 + unlisten */
+void vcl2_atfork_child (void);   /* fork 后子进程：释放锁 + 重建 worker 身份 */
 void vcl2_atfork_parent (
   void); /* fork 父进程（master）：从 accept 转发摘除自己 */
 int vcl2_session_unlisten (

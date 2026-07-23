@@ -106,8 +106,10 @@ int vcl2_app_attach_locked (void) {
   mp->options[APP_OPTIONS_EVT_QUEUE_SIZE] = vm->evt_queue_size;
 
   msg.type = APP_SAPI_MSG_TYPE_ATTACH;
+  pthread_mutex_lock (&vm->sapi_lock);
   err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
   if (err) {
+    pthread_mutex_unlock (&vm->sapi_lock);
     clib_error_free (err);
     return -EIO;
   }
@@ -115,6 +117,7 @@ int vcl2_app_attach_locked (void) {
   memset (&rmp, 0, sizeof (rmp));
   err = clib_socket_recvmsg (&vm->sapi_sock, &rmp, sizeof (rmp), fds,
                              ARRAY_LEN (fds));
+  pthread_mutex_unlock (&vm->sapi_lock);
   if (err) {
     clib_error_free (err);
     return -EIO;
@@ -173,10 +176,10 @@ int vcl2_app_attach_locked (void) {
    * 仅 fork 子进程经 atfork_child 显式注册新 worker。 */
   vm->app_wrk_index = 0;
   {
-    /* 一次性注册 fork handler：子进程经 vcl2_atfork_child 重建 worker 身份 */
     static int atfork_done;
     if (!atfork_done) {
-      pthread_atfork (0, vcl2_atfork_parent, vcl2_atfork_child);
+      pthread_atfork (vcl2_atfork_prepare, vcl2_atfork_parent,
+                      vcl2_atfork_child);
       atfork_done = 1;
     }
   }
@@ -202,8 +205,10 @@ int vcl2_worker_register_locked (void) {
   wp->is_add = 1;
 
   msg.type = APP_SAPI_MSG_TYPE_ADD_DEL_WORKER;
+  pthread_mutex_lock (&vm->sapi_lock);
   err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
   if (err) {
+    pthread_mutex_unlock (&vm->sapi_lock);
     clib_error_free (err);
     return -EIO;
   }
@@ -211,6 +216,7 @@ int vcl2_worker_register_locked (void) {
   memset (&rmp, 0, sizeof (rmp));
   err = clib_socket_recvmsg (&vm->sapi_sock, &rmp, sizeof (rmp), fds,
                              ARRAY_LEN (fds));
+  pthread_mutex_unlock (&vm->sapi_lock);
   if (err) {
     clib_error_free (err);
     return -EIO;
@@ -289,6 +295,12 @@ void vcl2_atfork_child (void) {
   if (PREDICT_FALSE (!vm->is_init))
     return;
 
+  /* 释放 prepare 持有的锁（逆序）——child 继承了锁状态，必须先释放才能后续操作 */
+  clib_rwlock_writer_unlock (&vm->segment_table_lock);
+  clib_rwlock_writer_unlock (&vm->sessions_lock);
+  pthread_mutex_unlock (&vm->sapi_lock);
+  pthread_mutex_unlock (&vm->app_mq_lock);
+
   vm->pid = getpid ();
 
   /* 关掉继承来的父进程 SAPI 连接（子进程的 fd 副本），开自己的 */
@@ -331,21 +343,47 @@ void vcl2_atfork_child (void) {
   }
 }
 
-/*
- * fork 后在【父进程（master）】跑：nginx master 自己不 accept（只管理 worker），
- * 但它创建了 listener、在 accept 轮转位图 al->workers 里。若不摘出，VPP 会把
- * ACCEPTED 轮给 master，而 master 不排空 app_event_queue → 连接卡死。
- * 故 master 把自己从所有 listener 的 al->workers 摘除（unlisten），只留 worker 接受。
- * （worker 已在 child handler 里 re-listen 加入位图；pthread_atfork child 先于 parent 跑。）
- */
-void vcl2_atfork_parent (void) {
+/* fork prepare：acquire 所有锁，使 child 继承干净（未锁）状态。
+ * POSIX fork 只复制调用线程——若有其他线程持锁，child 永久死锁。
+ * prepare 在 fork 前跑（父进程），acquire → parent/child 各自 release。
+ * 锁序：app_mq_lock → sapi_lock → sessions_lock → segment_table_lock */
+void vcl2_atfork_prepare (void) {
   vcl2_main_t *vm = &vcl2_main;
-  u32 i;
   if (PREDICT_FALSE (!vm->is_init))
     return;
+  pthread_mutex_lock (&vm->app_mq_lock);
+  pthread_mutex_lock (&vm->sapi_lock);
+  clib_rwlock_writer_lock (&vm->sessions_lock);
+  clib_rwlock_writer_lock (&vm->segment_table_lock);
+}
+
+/* fork 后在父进程跑：master 从所有 listener 的 accept 轮转中摘除自己（unlisten），
+ * 否则 VPP 会把 ACCEPTED 轮给不排空 event queue 的 master → 卡死。
+ * child handler 与 parent handler 分别在各自进程中跑，无先后保证。 */
+void vcl2_atfork_parent (void) {
+  vcl2_main_t *vm = &vcl2_main;
+  vcl2_handle_t *listeners = NULL;
+  u32 i;
+
+  if (PREDICT_FALSE (!vm->is_init))
+    return;
+
+  /* 释放 prepare 持有的锁（逆序） */
+  clib_rwlock_writer_unlock (&vm->segment_table_lock);
+  clib_rwlock_writer_unlock (&vm->sessions_lock);
+  pthread_mutex_unlock (&vm->sapi_lock);
+  pthread_mutex_unlock (&vm->app_mq_lock);
+
+  /* 读锁内收集 listener handle（防 vec realloc），锁外逐个 unlisten */
+  clib_rwlock_reader_lock (&vm->sessions_lock);
   for (i = 0; i < vec_len (vm->sessions); i++)
     if (vm->sessions[i].in_use && vm->sessions[i].is_listener)
-      vcl2_session_unlisten (vm->sessions[i].handle);
+      vec_add1 (listeners, vm->sessions[i].handle);
+  clib_rwlock_reader_unlock (&vm->sessions_lock);
+
+  vec_foreach_index (i, listeners)
+    vcl2_session_unlisten (listeners[i]);
+  vec_free (listeners);
 }
 
 /* recvmsg 一个 fd（SCM_RIGHTS）从 SAPI socket。VPP 在投 APP_ADD_SEGMENT 事件到
@@ -359,8 +397,10 @@ int vcl2_sapi_recv_fd (int *out_fd) {
 
   if (PREDICT_FALSE (!vm->sapi_connected))
     return -ENOTCONN;
+  pthread_mutex_lock (&vm->sapi_lock);
   err = clib_socket_recvmsg (&vm->sapi_sock, &dummy, sizeof (dummy), fds,
                              ARRAY_LEN (fds));
+  pthread_mutex_unlock (&vm->sapi_lock);
   if (err) {
     clib_error_free (err);
     return -EIO;
@@ -412,6 +452,7 @@ int vcl2_init (const char *app_name) {
   clib_rwlock_init (&vm->segment_table_lock);
   clib_rwlock_init (&vm->sessions_lock);
   pthread_mutex_init (&vm->app_mq_lock, NULL);
+  pthread_mutex_init (&vm->sapi_lock, NULL);
   vm->fd_base = VCL2_FD_BASE_DEFAULT;
   vm->app_name = strdup (app_name ? app_name : "vcl2_app");
   vm->pid = getpid ();
@@ -476,7 +517,9 @@ void vcl2_destroy (void) {
     mp->app_index = vm->app_index;
     mp->wrk_index = vm->app_wrk_index;
     mp->is_add = 0;
+    pthread_mutex_lock (&vm->sapi_lock);
     err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
+    pthread_mutex_unlock (&vm->sapi_lock);
     if (err)
       clib_error_free (err);
     clib_socket_close (&vm->sapi_sock);
@@ -492,6 +535,7 @@ void vcl2_destroy (void) {
   clib_rwlock_free (&vm->segment_table_lock);
   clib_rwlock_free (&vm->sessions_lock);
   pthread_mutex_destroy (&vm->app_mq_lock);
+  pthread_mutex_destroy (&vm->sapi_lock);
   memset (vm, 0, sizeof (*vm));
 }
 

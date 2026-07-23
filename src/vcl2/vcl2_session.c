@@ -308,6 +308,7 @@ int vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len) {
  */
 int vcl2_session_close (vcl2_handle_t h) {
   vcl2_main_t *vm = &vcl2_main;
+  u64 *child_disc = NULL; /* accept_q 子 session 的 vpp_handle，锁外发 DISCONNECT */
 
   clib_rwlock_writer_lock (&vm->sessions_lock);
   vcl2_session_t *s = vcl2_session_get (h);
@@ -318,9 +319,25 @@ int vcl2_session_close (vcl2_handle_t h) {
   VCL2_DBG ("close handle=%u vpp=0x%llx%s", s->handle,
             (unsigned long long) s->vpp_handle,
             s->is_listener ? " (listener)" : "");
-  /* 锁内只取发送所需字段 + 清缓存；解锁后再发 ctrl（避免 send 阻塞时长期持写锁）*/
+
   uint8_t is_listener = s->is_listener;
   uint64_t vpp_handle = s->vpp_handle;
+
+  /* listener：清理 accept_q 里未取走的子 session（已 accept 的不在此列） */
+  if (is_listener) {
+    u32 i;
+    for (i = 0; i < vec_len (s->accept_q); i++) {
+      vcl2_session_t *cs = vcl2_session_get (s->accept_q[i]);
+      if (cs && cs->vpp_handle) {
+        vec_add1 (child_disc, cs->vpp_handle);
+        hash_unset (vm->handle_to_session, (uword) s->accept_q[i]);
+        cs->in_use = 0;
+        cs->rx_fifo = cs->tx_fifo = 0;
+        cs->vpp_handle = 0;
+      }
+    }
+  }
+
   hash_unset (vm->handle_to_session, (uword) h);
   vec_free (s->accept_q);
   s->in_use = 0;
@@ -329,6 +346,7 @@ int vcl2_session_close (vcl2_handle_t h) {
   s->vpp_handle = 0;
   clib_rwlock_writer_unlock (&vm->sessions_lock);
 
+  /* 锁外发 ctrl（避免 send 阻塞持写锁） */
   if (is_listener && vm->ctrl_mq) {
     app_session_evt_t ae;
     session_unlisten_msg_t *mp;
@@ -352,6 +370,26 @@ int vcl2_session_close (vcl2_handle_t h) {
     VCL2_DBG ("DISCONNECT sent handle=%u vpp=0x%llx", h,
               (unsigned long long) vpp_handle);
   }
+
+  /* listener 关闭时，给 accept_q 里未取走的子 session 各发 DISCONNECT */
+  if (child_disc) {
+    u64 *vh;
+    vec_foreach (vh, child_disc) {
+      if (vm->vpp_evt_q) {
+        app_session_evt_t ae;
+        session_disconnect_msg_t *mp;
+        app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae,
+                                   SESSION_CTRL_EVT_DISCONNECT);
+        mp = (session_disconnect_msg_t *) ae.evt->data;
+        memset (mp, 0, sizeof (*mp));
+        mp->client_index = vm->api_client_handle;
+        mp->handle = *vh;
+        app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+      }
+    }
+    vec_free (child_disc);
+  }
+
   return 0;
 }
 
