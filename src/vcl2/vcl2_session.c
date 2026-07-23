@@ -77,11 +77,12 @@ int vcl2_session_create (vcl2_proto_t proto, uint8_t is_nonblocking) {
   vcl2_main_t *vm = &vcl2_main;
   vcl2_session_t *s;
   vcl2_handle_t h;
-  (void) proto;
   (void) is_nonblocking;
   clib_rwlock_writer_lock (&vm->sessions_lock);
-  h = ++vcl2_next_handle; /* 写锁独占，自增安全 */
+  h = ++vcl2_next_handle;
   s = vcl2_session_alloc (h);
+  if (s)
+    s->is_dgram = (proto == VCL2_PROTO_UDP) ? 1 : 0;
   clib_rwlock_writer_unlock (&vm->sessions_lock);
   if (!s)
     return -ENOMEM;
@@ -156,7 +157,14 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
   mp->context = h;
   mp->wrk_index = vm->app_wrk_index;
   mp->is_ip4 = is_ip4;
-  mp->proto = TRANSPORT_PROTO_TCP;
+  /* UDP session：用 TRANSPORT_PROTO_UDP（检查 session 的 is_dgram） */
+  {
+    clib_rwlock_reader_lock (&vm->sessions_lock);
+    vcl2_session_t *tmp = vcl2_session_get (h);
+    mp->proto = (tmp && tmp->is_dgram) ? TRANSPORT_PROTO_UDP
+                                       : TRANSPORT_PROTO_TCP;
+    clib_rwlock_reader_unlock (&vm->sessions_lock);
+  }
   mp->port = htons (port);
   if (ip) {
     /* ipv4 存在 ip46 offset 12（pad[3] 之后），必须用 set_ip4 */
@@ -285,7 +293,12 @@ int vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len) {
       return s->peer_closed ? 0 : -EINVAL;
     }
 
-    n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
+    /* UDP：app_recv_dgram_raw（剥 dgram 头）；TCP：app_recv_stream_raw */
+    if (s->is_dgram) {
+      app_session_transport_t at;
+      n = app_recv_dgram_raw (s->rx_fifo, (u8 *) buf, len, &at, 1, 0);
+    } else
+      n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
     pc = s->peer_closed;
     nb = s->nonblocking;
     clib_rwlock_reader_unlock (&vm->sessions_lock);

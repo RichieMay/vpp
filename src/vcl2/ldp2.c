@@ -201,18 +201,19 @@ int socket (int domain, int type, int protocol) {
   int t = type & ~(SOCK_CLOEXEC | SOCK_NONBLOCK);
   ldp2_init_check ();
 
-  /* 只接 IPv4/IPv6 TCP；其余原样走 libc */
-  if ((domain == AF_INET || domain == AF_INET6) && t == SOCK_STREAM &&
-      vcl2_is_init () && vcl2_main.app_index) {
-    int h =
-      vcl2_session_create (VCL2_PROTO_TCP, (type & SOCK_NONBLOCK) ? 1 : 0);
+  /* IPv4/IPv6 TCP + UDP；其余（unix dgram、raw 等）原样走 libc */
+  if ((domain == AF_INET || domain == AF_INET6) &&
+      (t == SOCK_STREAM || t == SOCK_DGRAM) && vcl2_is_init () &&
+      vcl2_main.app_index) {
+    vcl2_proto_t proto = (t == SOCK_DGRAM) ? VCL2_PROTO_UDP : VCL2_PROTO_TCP;
+    int h = vcl2_session_create (proto, (type & SOCK_NONBLOCK) ? 1 : 0);
     if (h < 0) {
       errno = -h;
       return -1;
     }
     int fd = vcl2_handle_to_fd ((vcl2_handle_t) h);
-    LDP2_DBG ("socket(AF %d STREAM) -> synthetic fd=%d (handle=%d)", domain, fd,
-              h);
+    LDP2_DBG ("socket(AF %d %s) -> fd=%d (handle=%d)", domain,
+              t == SOCK_DGRAM ? "DGRAM" : "STREAM", fd, h);
     return fd;
   }
   return libc_socket (domain, type, protocol);
@@ -866,17 +867,21 @@ int ioctl (int fd, unsigned long cmd, ...) {
   return libc_ioctl (fd, cmd, arg);
 }
 
-/* getsockopt：vcl2 fd 上返回合理值。SO_ERROR→0, SO_TYPE→SOCK_STREAM。 */
+/* getsockopt：vcl2 fd 上返回合理值。SO_ERROR→0, SO_TYPE→按 session 类型。 */
 int getsockopt (int fd, int level, int optname, void *optval,
                 socklen_t *optlen) {
   ldp2_init_check ();
   if (ldp2_fd_is_vcl2 (fd)) {
     if (optval && optlen && *optlen >= (socklen_t) sizeof (int)) {
-      if (level == SOL_SOCKET &&
-          (optname == SO_TYPE || optname == SO_DOMAIN))
-        *(int *) optval = SOCK_STREAM;
-      else
-        *(int *) optval = 0; /* SO_ERROR / 各 int 型选项统一 0 */
+      if (level == SOL_SOCKET && optname == SO_TYPE) {
+        vcl2_handle_t h = vcl2_fd_to_handle (fd);
+        clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
+        vcl2_session_t *s = vcl2_session_get (h);
+        *(int *) optval = (s && s->is_dgram) ? SOCK_DGRAM : SOCK_STREAM;
+        clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
+      } else {
+        *(int *) optval = 0; /* SO_ERROR / SO_DOMAIN / 各 int 型统一 0 */
+      }
     }
     return 0;
   }
@@ -1249,14 +1254,47 @@ int pselect (int nfds, fd_set *rset, fd_set *wset, fd_set *eset,
 
 ssize_t sendto (int fd, const void *buf, size_t n, int flags,
                 const struct sockaddr *addr, socklen_t addr_len) {
+  vcl2_handle_t h;
   ldp2_init_check ();
-  if (ldp2_fd_is_vcl2 (fd)) {
-    (void) flags;
-    (void) addr; /* TCP connected: addr 应为 NULL */
-    (void) addr_len;
-    return vcl2_session_send (vcl2_fd_to_handle (fd), buf, n);
+  if (!ldp2_fd_is_vcl2 (fd))
+    return libc_sendto (fd, buf, n, flags, addr, addr_len);
+
+  h = vcl2_fd_to_handle (fd);
+  (void) flags;
+
+  /* UDP 未连接 + 有目标地址：懒 connect 到该地址 */
+  if (addr && addr_len >= sizeof (struct sockaddr_in)) {
+    clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
+    vcl2_session_t *s = vcl2_session_get (h);
+    uint8_t need_connect = (s && s->is_dgram && !s->vpp_handle);
+    clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
+
+    if (need_connect) {
+      const struct sockaddr_in *a4 = (const struct sockaddr_in *) addr;
+      uint8_t ip[16], is_ip4;
+      uint16_t port;
+      if (a4->sin_family == AF_INET) {
+        is_ip4 = 1;
+        memcpy (ip, &a4->sin_addr, 4);
+        port = a4->sin_port;
+      } else if (addr_len >= sizeof (struct sockaddr_in6)) {
+        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *) addr;
+        is_ip4 = 0;
+        memcpy (ip, &a6->sin6_addr, 16);
+        port = a6->sin6_port;
+      } else {
+        errno = EAFNOSUPPORT;
+        return -1;
+      }
+      int rv = vcl2_session_connect (h, is_ip4, ip, port);
+      if (rv < 0) {
+        errno = -rv;
+        return -1;
+      }
+    }
   }
-  return libc_sendto (fd, buf, n, flags, addr, addr_len);
+
+  return vcl2_session_send (h, buf, n);
 }
 
 ssize_t recvfrom (int fd, void *buf, size_t n, int flags,

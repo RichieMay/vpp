@@ -87,6 +87,7 @@ typedef struct {
   int ctrl_rv;       /* CONNECTED/BOUND 结果（retval 或 -errno） */
   /* server 侧（listen/accept） */
   uint8_t is_listener; /* BOUND 后置位 */
+  uint8_t is_dgram;    /* UDP：recv 用 app_recv_dgram_raw */
   uint8_t lcl_is_ip4;  /* bind() 存的本地地址，listen() 用 */
   uint8_t lcl_ip[16];
   uint16_t lcl_port;
