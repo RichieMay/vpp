@@ -70,35 +70,46 @@ static ssize_t (*libc_readv) (int, const struct iovec *, int);
 static ssize_t (*libc_sendfile) (int, int, off_t *, size_t);
 static int (*libc_shutdown) (int, int);
 
+/* 对齐 VCL ldp_socket_wrapper.c：显式 dlopen libc 解析符号，
+ * 不用 RTLD_NEXT（多层 LD_PRELOAD 下后者可能解析到错误的库）。
+ * handle 保持打开（符号指针依赖它；进程生命周期内不 dlclose）。 */
+static void *libc_handle;
+
 static void ldp2_resolve_libc (void) {
-  libc_socket = dlsym (RTLD_NEXT, "socket");
-  libc_connect = dlsym (RTLD_NEXT, "connect");
-  libc_read = dlsym (RTLD_NEXT, "read");
-  libc_write = dlsym (RTLD_NEXT, "write");
-  libc_recv = dlsym (RTLD_NEXT, "recv");
-  libc_send = dlsym (RTLD_NEXT, "send");
-  libc_close = dlsym (RTLD_NEXT, "close");
-  libc_epoll_create1 = dlsym (RTLD_NEXT, "epoll_create1");
-  libc_epoll_ctl = dlsym (RTLD_NEXT, "epoll_ctl");
-  libc_epoll_wait = dlsym (RTLD_NEXT, "epoll_wait");
-  libc_bind = dlsym (RTLD_NEXT, "bind");
-  libc_listen = dlsym (RTLD_NEXT, "listen");
-  libc_accept4 = dlsym (RTLD_NEXT, "accept4");
-  libc_accept = dlsym (RTLD_NEXT, "accept");
-  libc_setsockopt = dlsym (RTLD_NEXT, "setsockopt");
-  libc_getsockopt = dlsym (RTLD_NEXT, "getsockopt");
-  libc_getsockname = dlsym (RTLD_NEXT, "getsockname");
-  libc_getpeername = dlsym (RTLD_NEXT, "getpeername");
-  libc_poll = dlsym (RTLD_NEXT, "poll");
-  libc_select = dlsym (RTLD_NEXT, "select");
-  libc_pselect = dlsym (RTLD_NEXT, "pselect");
-  libc_fcntl = dlsym (RTLD_NEXT, "fcntl");
-  libc_fcntl64 = dlsym (RTLD_NEXT, "fcntl64");
-  libc_ioctl = dlsym (RTLD_NEXT, "ioctl");
-  libc_writev = dlsym (RTLD_NEXT, "writev");
-  libc_readv = dlsym (RTLD_NEXT, "readv");
-  libc_sendfile = dlsym (RTLD_NEXT, "sendfile");
-  libc_shutdown = dlsym (RTLD_NEXT, "shutdown");
+  libc_handle = dlopen ("libc.so.6", RTLD_LAZY);
+  if (!libc_handle)
+    libc_handle = RTLD_NEXT; /* 回退：单 preload 场景仍可靠 */
+
+#define RESOLVE(sym) libc_##sym = dlsym (libc_handle, #sym)
+  RESOLVE (socket);
+  RESOLVE (connect);
+  RESOLVE (read);
+  RESOLVE (write);
+  RESOLVE (recv);
+  RESOLVE (send);
+  RESOLVE (close);
+  RESOLVE (epoll_create1);
+  RESOLVE (epoll_ctl);
+  RESOLVE (epoll_wait);
+  RESOLVE (bind);
+  RESOLVE (listen);
+  RESOLVE (accept4);
+  RESOLVE (accept);
+  RESOLVE (setsockopt);
+  RESOLVE (getsockopt);
+  RESOLVE (getsockname);
+  RESOLVE (getpeername);
+  RESOLVE (poll);
+  RESOLVE (select);
+  RESOLVE (pselect);
+  RESOLVE (fcntl);
+  RESOLVE (fcntl64);
+  RESOLVE (ioctl);
+  RESOLVE (writev);
+  RESOLVE (readv);
+  RESOLVE (sendfile);
+  RESOLVE (shutdown);
+#undef RESOLVE
 }
 
 /* vcl2 初始化：eager constructor（main 前 attach，失败则 _exit(1)）。
