@@ -69,6 +69,12 @@ static ssize_t (*libc_writev) (int, const struct iovec *, int);
 static ssize_t (*libc_readv) (int, const struct iovec *, int);
 static ssize_t (*libc_sendfile) (int, int, off_t *, size_t);
 static int (*libc_shutdown) (int, int);
+static ssize_t (*libc_sendto) (int, const void *, size_t, int,
+                               const struct sockaddr *, socklen_t);
+static ssize_t (*libc_recvfrom) (int, void *, size_t, int,
+                                 struct sockaddr *, socklen_t *);
+static ssize_t (*libc_sendmsg) (int, const struct msghdr *, int);
+static ssize_t (*libc_recvmsg) (int, struct msghdr *, int);
 
 /* 对齐 VCL ldp_socket_wrapper.c：显式 dlopen libc 解析符号，
  * 不用 RTLD_NEXT（多层 LD_PRELOAD 下后者可能解析到错误的库）。
@@ -109,6 +115,10 @@ static void ldp2_resolve_libc (void) {
   RESOLVE (readv);
   RESOLVE (sendfile);
   RESOLVE (shutdown);
+  RESOLVE (sendto);
+  RESOLVE (recvfrom);
+  RESOLVE (sendmsg);
+  RESOLVE (recvmsg);
 #undef RESOLVE
 }
 
@@ -748,7 +758,16 @@ static int ldp2_accept_common (int fd, struct sockaddr *addr,
     }
     clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
   }
-  (void) flags;
+
+  /* accept4 SOCK_NONBLOCK：设置子 session 非阻塞 */
+  if (flags & SOCK_NONBLOCK) {
+    clib_rwlock_writer_lock (&vcl2_main.sessions_lock);
+    vcl2_session_t *cs = vcl2_session_get ((vcl2_handle_t) nh);
+    if (cs)
+      cs->nonblocking = 1;
+    clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
+  }
+
   return vcl2_handle_to_fd (nh);
 }
 
@@ -847,44 +866,77 @@ int ioctl (int fd, unsigned long cmd, ...) {
   return libc_ioctl (fd, cmd, arg);
 }
 
-/* getsockopt：vcl2 fd 上 SO_ERROR→0（无错误），其余返回成功不填（iperf 的
- * TCP_INFO 等用于统计，失败非致命）。 */
+/* getsockopt：vcl2 fd 上返回合理值。SO_ERROR→0, SO_TYPE→SOCK_STREAM。 */
 int getsockopt (int fd, int level, int optname, void *optval,
                 socklen_t *optlen) {
   ldp2_init_check ();
   if (ldp2_fd_is_vcl2 (fd)) {
-    if (optval && optlen && *optlen >= (socklen_t) sizeof (int))
-      *(int *) optval = 0; /* SO_ERROR / 各 int 型选项统一 0 */
+    if (optval && optlen && *optlen >= (socklen_t) sizeof (int)) {
+      if (level == SOL_SOCKET &&
+          (optname == SO_TYPE || optname == SO_DOMAIN))
+        *(int *) optval = SOCK_STREAM;
+      else
+        *(int *) optval = 0; /* SO_ERROR / 各 int 型选项统一 0 */
+    }
     return 0;
   }
   return libc_getsockopt (fd, level, optname, optval, optlen);
 }
 
-/* getsockname/getpeername：vcl2 fd 上回填一个占位 IPv4 地址（iperf 仅用于日志）。
- * TODO: 从 session 的 lcl/rmt 字段回填真实地址。 */
-static int ldp2_fill_name (int fd, struct sockaddr *addr, socklen_t *len) {
-  struct sockaddr_in a;
-  memset (&a, 0, sizeof (a));
-  a.sin_family = AF_INET;
-  if (addr && len && *len >= (socklen_t) sizeof (a)) {
-    memcpy (addr, &a, sizeof (a));
-    *len = sizeof (a);
+/* getsockname/getpeername：从 session 缓存回填真实地址。
+ * ldp2_fill_name(fd, addr, len, is_peer=1) → peer 地址（rmt_*）
+ * ldp2_fill_name(fd, addr, len, is_peer=0) → 本地地址（lcl_*） */
+static int ldp2_fill_name (int fd, struct sockaddr *addr, socklen_t *len,
+                           int is_peer) {
+  vcl2_handle_t h = vcl2_fd_to_handle (fd);
+  int ret = 0;
+
+  if (!addr || !len)
+    return 0;
+
+  clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
+  vcl2_session_t *s = vcl2_session_get (h);
+  if (s) {
+    uint8_t is_ip4 = is_peer ? s->rmt_is_ip4 : s->lcl_is_ip4;
+    uint8_t *ip = is_peer ? s->rmt_ip : s->lcl_ip;
+    uint16_t port = is_peer ? s->rmt_port : s->lcl_port;
+
+    if (is_ip4 && *len >= (socklen_t) sizeof (struct sockaddr_in)) {
+      struct sockaddr_in a;
+      memset (&a, 0, sizeof (a));
+      a.sin_family = AF_INET;
+      memcpy (&a.sin_addr, ip, 4);
+      a.sin_port = port;
+      memcpy (addr, &a, sizeof (a));
+      *len = sizeof (a);
+    } else if (*len >= (socklen_t) sizeof (struct sockaddr_in6)) {
+      struct sockaddr_in6 a6;
+      memset (&a6, 0, sizeof (a6));
+      a6.sin6_family = AF_INET6;
+      memcpy (&a6.sin6_addr, ip, 16);
+      a6.sin6_port = port;
+      memcpy (addr, &a6, sizeof (a6));
+      *len = sizeof (a6);
+    }
+  } else {
+    ret = -1;
+    errno = EBADF;
   }
-  (void) fd;
-  return 0;
+  clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
+  return ret;
 }
 
 int getsockname (int fd, struct sockaddr *addr, socklen_t *len) {
   ldp2_init_check ();
   if (ldp2_fd_is_vcl2 (fd))
-    return ldp2_fill_name (fd, addr, len);
+    return ldp2_fill_name (fd, addr, len, 0);
   return libc_getsockname (fd, addr, len);
 }
 
 int getpeername (int fd, struct sockaddr *addr, socklen_t *len) {
   ldp2_init_check ();
   if (ldp2_fd_is_vcl2 (fd))
-    return ldp2_fill_name (fd, addr, len);
+    return ldp2_fill_name (fd, addr, len, 1);
   return libc_getpeername (fd, addr, len);
 }
 
@@ -1189,4 +1241,60 @@ int pselect (int nfds, fd_set *rset, fd_set *wset, fd_set *eset,
     return select (nfds, rset, wset, eset, &tv);
   }
   return select (nfds, rset, wset, eset, 0);
+}
+
+/* ==================== sendto / recvfrom / sendmsg / recvmsg ====================
+ * TCP vcl2 fd 上等价于 send/recv/writev/readv（addr=NULL 的 connected socket）。
+ * 非 vcl2 fd 透传 libc。 */
+
+ssize_t sendto (int fd, const void *buf, size_t n, int flags,
+                const struct sockaddr *addr, socklen_t addr_len) {
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd)) {
+    (void) flags;
+    (void) addr; /* TCP connected: addr 应为 NULL */
+    (void) addr_len;
+    return vcl2_session_send (vcl2_fd_to_handle (fd), buf, n);
+  }
+  return libc_sendto (fd, buf, n, flags, addr, addr_len);
+}
+
+ssize_t recvfrom (int fd, void *buf, size_t n, int flags,
+                  struct sockaddr *addr, socklen_t *addr_len) {
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd)) {
+    ssize_t rv;
+    (void) flags;
+    rv = vcl2_session_recv (vcl2_fd_to_handle (fd), buf, n);
+    if (rv >= 0 && addr && addr_len)
+      ldp2_fill_name (fd, addr, addr_len, 1); /* 回填 peer 地址 */
+    return rv;
+  }
+  return libc_recvfrom (fd, buf, n, flags, addr, addr_len);
+}
+
+ssize_t sendmsg (int fd, const struct msghdr *msg, int flags) {
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd)) {
+    if (PREDICT_FALSE (!msg)) {
+      errno = EFAULT;
+      return -1;
+    }
+    (void) flags;
+    return writev (fd, msg->msg_iov, msg->msg_iovlen);
+  }
+  return libc_sendmsg (fd, msg, flags);
+}
+
+ssize_t recvmsg (int fd, struct msghdr *msg, int flags) {
+  ldp2_init_check ();
+  if (ldp2_fd_is_vcl2 (fd)) {
+    if (PREDICT_FALSE (!msg)) {
+      errno = EFAULT;
+      return -1;
+    }
+    (void) flags;
+    return readv (fd, msg->msg_iov, msg->msg_iovlen);
+  }
+  return libc_recvmsg (fd, msg, flags);
 }
