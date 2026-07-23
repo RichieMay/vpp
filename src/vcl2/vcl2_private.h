@@ -146,6 +146,9 @@ typedef struct {
   uint32_t tls_ckpair_index;
   const char *tls_cert_file;
   const char *tls_key_file;
+  /* close(listener) 同步等 UNLISTEN_REPLY 用：unlisten_ctx=正在等的 vcl2 handle(~0=无) */
+  uint32_t unlisten_ctx;
+  uint8_t unlisten_done;
   /* 多线程锁（方案 C：单一共享 worker + 锁）。所有被锁结构都是【可丢弃缓存】，
    * 非跨进程资源 —— 单侧所有权不变。
    *  - segment_table_lock：保护 segment_table hash + segment_main（段映射）

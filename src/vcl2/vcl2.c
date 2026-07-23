@@ -589,6 +589,7 @@ int vcl2_init (const char *app_name) {
     vm->tls_key_file = s && s[0] ? strdup (s) : NULL;
   }
   vm->tls_ckpair_index = ~0;
+  vm->unlisten_ctx = ~0;
 
   /* 配置默认（P1 用默认；后续可读 VCL2_CONFIG） */
   vm->rx_fifo_size = VCL2_RX_FIFO_SIZE_DEFAULT;

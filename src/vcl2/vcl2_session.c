@@ -501,6 +501,27 @@ int vcl2_session_close (vcl2_handle_t h) {
     mp->wrk_index = vm->app_wrk_index;
     mp->handle = vpp_handle;
     app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &ae);
+
+    /* 同步等 UNLISTEN_REPLY 再返回：镜像内核同步 close 语义——确保 VPP 完全拆除
+     * 旧 listener 后，app 才能 rebind 同端口新 listener。否则 VPP 在 UNLISTEN 未
+     * 完成时处理新 LISTEN，会话层状态错乱 → 顺序客户端（iperf3 -s 每客户端重 listen）
+     * 在若干轮后停止投递 ACCEPTED → 挂起。deadline 2s 兜底（VPP 正常 <1ms 回）。
+     * listener close 在服务循环里单线程发生（iperf3/nginx worker），全局 ctx/done 安全。*/
+    vm->unlisten_ctx = h;
+    vm->unlisten_done = 0;
+    {
+      struct timespec t0, now;
+      long deadline_ms;
+      clock_gettime (CLOCK_MONOTONIC, &t0);
+      deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + 2000;
+      while (!vm->unlisten_done) {
+        clock_gettime (CLOCK_MONOTONIC, &now);
+        if ((long) (now.tv_sec * 1000 + now.tv_nsec / 1000000) >= deadline_ms)
+          break;
+        vcl2_mq_wait_dispatch (0.001);
+      }
+      vm->unlisten_ctx = ~0;
+    }
   } else if (!is_listener && vpp_handle && vm->vpp_evt_q) {
     app_session_evt_t ae;
     session_disconnect_msg_t *mp;
@@ -892,6 +913,17 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
         VCL2_DBG ("BOUND handle=%u rv=%d", bs->handle, bs->ctrl_rv);
       }
       clib_rwlock_writer_unlock (&vm->sessions_lock);
+    } else if (e->event_type == SESSION_CTRL_EVT_UNLISTEN_REPLY) {
+      /* unlisten 回复：close(listener) 同步等它，确保 VPP 拆除旧 listener 后再 rebind
+       *（镜像内核同步 close 语义；避免 VPP 在 UNLISTEN 未完成时处理新 LISTEN →
+       * 顺序客户端挂起）。按 context 匹配正在等待的 close。*/
+      session_unlisten_reply_msg_t *urm =
+        (session_unlisten_reply_msg_t *) e->data;
+      if (urm->context == vm->unlisten_ctx) {
+        vm->unlisten_done = 1;
+        VCL2_DBG ("UNLISTEN_REPLY handle=%u rv=%d", urm->context,
+                  (int) urm->retval);
+      }
     }
     svm_msg_q_free_msg (mq, &msg);
   }
