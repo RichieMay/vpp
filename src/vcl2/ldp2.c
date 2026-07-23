@@ -1,23 +1,9 @@
-/*
- * SPDX-License-Identifier: Apache-2.0
+/* SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 vpp_runtime
  *
- * ldp2 —— LD_PRELOAD 拦截层（P4a：核心 socket/connect/read/write/recv/send/close）。
- *
- * 独立于 src/vcl/ldp.c。把未改 app 的 libc socket 调用 transparently 路由到 vcl2：
- *   socket()  → vcl2_session_create()，返回合成 fd（fd = base + handle）
- *   connect() → vcl2_session_connect()
- *   read/recv → vcl2_session_recv()
- *   write/send→ vcl2_session_send()
- *   close()   → vcl2_session_close()（单侧：只丢 app 侧缓存槽）
- *
- * 非 vcl2 的 fd（真实内核 fd）一律 passthrough 到 dlsym(RTLD_NEXT) 拿到的真 libc。
- * 仅拦截 AF_INET/AF_INET6 + SOCK_STREAM；其余（unix dgram、raw 等）走 libc。
- *
+ * ldp2 — LD_PRELOAD 拦截层。libc socket 调用路由到 vcl2（合成 fd = base+handle），
+ * 真 fd 直接 passthrough。仅拦截 AF_INET/INET6 + SOCK_STREAM。
  * 用法：LD_PRELOAD=libvcl2_ldpreload.so <app>
- *
- * P4a 范围：阻塞式 socket 客户端（socket→connect→write→read→close）。
- * epoll/accept/listen/bind/fork 在 P4b/P5。
  */
 
 #define _GNU_SOURCE
@@ -115,17 +101,8 @@ static void ldp2_resolve_libc (void) {
   libc_shutdown = dlsym (RTLD_NEXT, "shutdown");
 }
 
-/* ---------- vcl2 初始化（对齐原版 VCL ldp.c：eager constructor + 预置 flag） ----------
- *
- * 与原版 VCL 同机制（不再用 pthread_once / mutex / __thread）：
- *  - eager：constructor（main 之前）就完成 attach；attach 失败则 _exit(1) 杀进程
- *    （与 VCL ldp_constructor 行为一致：没挂上 VPP 就别让 app 起来）。
- *  - 预置 flag：ldp2_init_done = 1 置于 vcl2_app_attach 之【前】。attach 内部
- *    clib_socket_init 会调 libc socket()/connect()，那些已被本文件拦截 → 拦截器
- *    开头的 ldp2_init_check() 看到 done==1 直接返回，不重入 init（否则死循环/死锁）。
- *  - 域过滤：SAPI 的 AF_UNIX socket 不满足 AF_INET/INET6 条件 → 落 else 走 libc_socket，
- *    本就不会建 vcl2 session。
- */
+/* vcl2 初始化：eager constructor（main 前 attach，失败则 _exit(1)）。
+ * 预置 ldp2_init_done=1 防 attach 内 socket()/connect() 重入拦截死循环。 */
 static int ldp2_init_done;
 
 /* 返回 0=成功，非 0=失败（errno 风格）。成功时 ldp2_init_done=1。 */
@@ -412,17 +389,8 @@ int close (int fd) {
   return libc_close (fd);
 }
 
-/* ==================== epoll（P4b）====================
- *
- * 设计：返回【真】libc epoll fd（不是合成 fd）。app 看到的是普通 epoll fd：
- *  - 真 fd 的 EPOLL_CTL_ADD/MOD/DEL 直接落到 libc_epoll_ctl（原生）。
- *  - vcl2 fd 的注册记在侧表 ldp2_ep_t.regs[handle]，并把 app_event_queue 的
- *    eventfd（mq->q.evtfd）加进真 epoll 一次。VPP 投事件时会 signal 该 eventfd。
- *  - epoll_wait：先查各 vcl2 fd 的 fifo 即时就绪（rx 有数据→IN，tx 有空间→OUT）；
- *    无就绪则阻塞在 libc_epoll_wait（eventfd 或真 fd 唤醒）；eventfd 唤醒后
- *    排空 app_event_queue 再复查 vcl2 fd。真 fd 事件原样透传。
- * 比 VCL 的 vep 简单（无 lt/et 链表、无 mq_evt_conns），但语义等价。
- */
+/* epoll：返回真 libc epoll fd。vcl2 fd 注册记侧表 regs[handle]，eventfd 加进真 epoll。
+ * epoll_wait：查 vcl2 fifo 即时就绪 + 阻塞 libc_epoll_wait（eventfd 唤醒后 drain+复查）。 */
 
 /* 单个 vcl2 fd 在某 epoll 上的注册 */
 typedef struct {

@@ -1,16 +1,8 @@
-/*
- * SPDX-License-Identifier: Apache-2.0
+/* SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 vpp_runtime
  *
- * vcl2 核心入口（P0 骨架 + P1 SAPI 控制面）。
- *
- * 对比原 VCL（src/vcl/vppcom.c）：本文件【不】分配 sessions pool、accept_evts_fifo、
- * 私有堆。vcl2_init 只读配置；vcl2_app_attach 经 SAPI(SEQPACKET) 复用 app-socket-api
- * 消息完成 app 注册 + worker-0 注册，拿到 app_index / app_wrk_index，并暂存 VPP 返回的
- * 段 fd（P2 mmap）。进程死 = 关 sapi_sock（+ 内核 munmap 映射段 + VPP barrier 单侧回收），
- * 无 app 侧多步 teardown。
- *
- * P1 复用 src/vcl/vcl_sapi.c 的同一协议（app_sapi_msg_t），只是客户端更薄。
+ * vcl2 核心入口：vcl2_init 读配置，vcl2_app_attach 经 SAPI 完成 app+worker-0 注册。
+ * 单侧所有权：进程死靠 SAPI close + VPP 回收，无 app 侧 teardown。
  */
 
 #include <stdio.h>
@@ -177,16 +169,8 @@ int vcl2_app_attach_locked (void) {
             vm->app_index, (unsigned long) vm->segment_handle,
             vm->app_event_queue, vm->ctrl_mq);
 
-  /* 镜像 VCL：attach 已在 VPP 侧隐式创建 worker 0（vnet_application_attach 内
-   * application_alloc_worker_and_init）。本进程（master / 单进程 app）直接复用
-   * worker 0，【不】再显式 ADD_DEL_WORKER——否则会创建第二个 worker，而 attach 创建
-   * 的 worker 0 永不被 UDS 检测回收（sapi_socket_detach 只摘 aah_app_wrk_index 指向的
-   * 那个 worker）→ application_n_workers 永不为 0 → app entry 泄漏（2026-07-21 P6 根因）。
-   * 只有 fork 出来的子进程才需要显式 add（vcl2_atfork_child→vcl2_worker_register_locked）。
-   *
-   * 单侧所有权一致：app 退出【不】发任何清理消息（违背设计）；VPP 靠 SAPI UDS close
-   * 单侧回收。master 用 worker 0 后，其 socket 的 aah_app_wrk_index 在 VPP attach 路径
-   * 设置，close 时被正确 detach。*/
+  /* 复用 attach 隐式创建的 worker 0（不显式 ADD_DEL_WORKER，否则旧 worker 不被回收→泄漏）。
+   * 仅 fork 子进程经 atfork_child 显式注册新 worker。 */
   vm->app_wrk_index = 0;
   {
     /* 一次性注册 fork handler：子进程经 vcl2_atfork_child 重建 worker 身份 */
@@ -296,17 +280,8 @@ failed:
   return -EINVAL;
 }
 
-/*
- * fork 子进程的 atfork child handler。
- *
- * 关键（单侧所有权 + fd继承/身份不继承）：fork 后子进程【继承】了父进程的
- * vcl2_main 内存——包括 app_index、ctrl_mq（app 级、MAP_SHARED 段映射，子进程
- * 共享有效）、sessions 缓存（含 listener，子进程可直接 accept）。但子进程的
- * SAPI 连接是父进程的 app-worker 身份，必须【重建身份】：开自己的 SAPI、向 VPP
- * 注册为一个新 worker（同 app）→ 拿到自己的 app_event_queue / vpp_evt_q / wrk_index。
- *
- * 在 fork() 返回给 app 前（pthread_atfork child 回调）跑完 → nginx worker 看到就绪的 vcl2。
- */
+/* fork child handler：子进程继承 sessions 缓存（含 listener）但需重建 SAPI 身份——
+ * 开自己的 SAPI、注册为新 worker，拿到自己的 app_event_queue。在 fork() 返回前跑完。 */
 void vcl2_atfork_child (void) {
   vcl2_main_t *vm = &vcl2_main;
   int rv;

@@ -1,19 +1,9 @@
-/*
- * SPDX-License-Identifier: Apache-2.0
+/* SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 vpp_runtime
  *
  * vcl2 session 操作（控制面 + 数据面）。
- *
- * 多线程（方案 C）：单一共享 worker + sessions_lock（rwlock）保护 sessions 缓存。
- * 关键不变量（指针稳定性）：vcl2_session_get/get_by_vpp_handle 返回指向 sessions vec
- * 的指针；vec 可能在 alloc（vec_add2）时 realloc。故：
- *   - vcl2_session_get / get_by_vpp_handle / alloc 【假定调用者已持有 sessions_lock】
- *     （读锁或写锁）；返回的指针仅在锁持有期间有效。
- *   - 所有公开操作（recv/send/connect/listen/accept/close/shutdown/dispatch）自行加锁，
- *     围绕"取指针→用指针"段；【阻塞等待（svm_msg_q_timedwait）前必须解锁】，下一轮重新
- *     取锁+取指针。
- *   - 锁序：sessions_lock（外）→ segment_table_lock（内）。vcl2_segment_* 只取 segment 锁。
- * 单侧所有权不变：被锁的全是可丢弃缓存，无 app 拥有的资源。
+ * 指针稳定性：sessions_lock（rwlock）保护 sessions vec（alloc 可能 realloc），
+ * get/alloc 假定调用者持锁；阻塞等待前必须解锁。锁序 sessions_lock→segment_table_lock。
  */
 
 #include <stdio.h>
@@ -570,23 +560,9 @@ int vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t *out) {
   return -EAGAIN; /* not reached */
 }
 
-/*
- * mq 排空与分发（多线程串行化，A 修复）。
- *
- * timedwait(可选) 在 app_mq_lock【内】（持锁 poll eventfd + 排空 + 就地处理）。实测：
- * timedwait 放锁外会让 worker 与主线程 select 在同一 eventfd 上并发 poll+read，反而引发
- * 丢唤醒/重复 drain，导致 iperf MT 6/6 stall；持锁等待则串行化 wait+drain，6/6 通过。
- * （持锁等待短期占 app_mq 不会饿死主线程——worker 仅在 fifo 空时等 1ms，数据流动时
- * recv 直接返回不经此路径。）
- * 就地处理含 sessions_lock(W)（DISCONNECTED/ACCEPTED/CONNECTED/BOUND）。死锁分析：经审查
- * 【无任何路径在持有 sessions_lock 时获取 app_mq_lock】——所有数据/ctrl 路径都是先释放
- * sessions_lock 再取 app_mq_lock。故锁序单向 app_mq_lock→sessions_lock，无环、无死锁。
- *
- * 关键：session_event_t 是【头部 + data[] 柔性数组】（payload 在 mq buffer 内紧跟头部，
- * 见 session_types.h:476），故必须在 free_msg【前】就地读 payload——不可只拷贝 header
- * 延后处理（否则 payload 随 free_msg 失效）。ADD_SEGMENT 的 sapi fd recv 亦须按 mq 全局
- * 顺序，故同样就地。
- */
+/* mq 排空与分发。timedwait + drain + 就地处理在 app_mq_lock 内（串行化 wait+drain，
+ * 避免锁外并发 poll 丢唤醒）。锁序单向 app_mq_lock→sessions_lock（drain 内取 W），无环。
+ * session_event_t 是头+data[]柔性数组，payload 在 mq buffer 内，必须 free_msg 前就地读。 */
 void vcl2_mq_wait_dispatch (double timeout_s) {
   vcl2_main_t *vm = &vcl2_main;
   svm_msg_q_t *mq = vm->app_event_queue;

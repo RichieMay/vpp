@@ -1,19 +1,8 @@
-/*
- * SPDX-License-Identifier: Apache-2.0
+/* SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 vpp_runtime
  *
- * vcl2 段管理（P2）。
- *
- * 所有段都是【VPP-owned】：VPP 经 segment_manager 分配，把 fd 经 SCM_RIGHTS 发给 app；
- * app 这里只 mmap（fifo_segment_attach），不拥有。进程退出内核自动 munmap；
- * VPP 侧检测 app 死后自行回收。无 app 侧段 free 协议。
- *
- * 复用 libsvm 的 fifo_segment_* （与 src/vcl/vcl_private.c 同一套机制）。
- *
- * 多线程（方案 C）：segment_table hash + segment_main 由 segment_table_lock（rwlock）
- * 保护。attach=写锁，lookup/alloc_fifo/attach_mq=读锁。各公开函数自含加锁（内联
- * hash_get，避免嵌套）。锁序：sessions_lock（外）→ segment_table_lock（内）—— 本文件
- * 函数只取 segment_table_lock，不碰 sessions。
+ * vcl2 段管理。段为 VPP-owned（app 只 mmap，退出内核自动 munmap，VPP 回收）。
+ * segment_table_lock（rwlock）保护 hash + segment_main。锁序 sessions_lock→segment_table_lock。
  */
 
 #include <string.h>

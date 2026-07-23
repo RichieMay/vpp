@@ -1,13 +1,8 @@
-/*
- * SPDX-License-Identifier: Apache-2.0
+/* SPDX-License-Identifier: Apache-2.0
  * Copyright (c) 2026 vpp_runtime
  *
- * vcl2 内部结构。
- *
- * 关键不变量（与原 VCL 的本质区别）：
- *   vcl2_main_t 里【没有】sessions pool、accept_evts_fifo、mq 向量、bitmap、私有堆。
- *   只有：SAPI clib_socket + app/app_wrk index + 段映射表 + 可丢弃 fd-cache + 暂存的 attach 段 fd。
- *   进程死无需多步 free：内核 munmap 映射段 + VPP 单侧 barrier 回收。
+ * vcl2 内部结构。vcl2_main_t 无 sessions pool/私有堆，只有 SAPI socket + app index
+ * + 段映射表 + 可丢弃缓存。
  */
 
 #ifndef included_vcl2_private_h
