@@ -179,11 +179,13 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
     for (;;) {
       uint8_t done;
       int rv;
+
       clib_rwlock_reader_lock (&vm->sessions_lock);
       vcl2_session_t *s = vcl2_session_get (h);
       done = s ? s->ctrl_done : 0;
       rv = s ? s->ctrl_rv : -EINVAL;
       clib_rwlock_reader_unlock (&vm->sessions_lock);
+
       if (done) {
         /* 清标志（防复用；connect 每 session 一次，清掉无副作用）*/
         clib_rwlock_writer_lock (&vm->sessions_lock);
@@ -215,35 +217,40 @@ int vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len) {
 
   if (!len)
     return 0;
+
   for (;;) {
     int have_space;
+
     clib_rwlock_reader_lock (&vm->sessions_lock);
     vcl2_session_t *s = vcl2_session_get (h);
+
     if (!s) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -EINVAL;
     }
     if (s->wr_shutdown || !s->tx_fifo) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
-      return -EPIPE; /* wr_shutdown 或 peer 断开（tx_fifo 被 DISCONNECTED 置 NULL）*/
+      return -EPIPE;
     }
     if (!vm->vpp_evt_q) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -ENOTCONN;
     }
+
     have_space = svm_fifo_max_enqueue_prod (s->tx_fifo) >= (int) len;
     if (s->nonblocking && !have_space) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -EAGAIN;
     }
+
     if (have_space) {
       n = app_send_stream_raw (s->tx_fifo, vm->vpp_evt_q, (u8 *) buf, len,
                                SESSION_IO_EVT_TX, 1, 0);
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return n < 0 ? -EAGAIN : n;
     }
-    /* 无空间：arm want-deq-ntf，解锁后 1ms 有界重查等（app_mq_lock 内）。MT 下与
-       * recv 同理：主线程可能偷 eventfd，1ms 兜底重看 tx 空间。顺带排空分发。*/
+
+    /* 无空间：arm ntf，解锁后等 */
     svm_fifo_add_want_deq_ntf (s->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
     clib_rwlock_reader_unlock (&vm->sessions_lock);
     vcl2_mq_wait_dispatch (0.001);
@@ -260,8 +267,10 @@ int vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len) {
 
   for (;;) {
     uint8_t pc, nb;
+
     clib_rwlock_reader_lock (&vm->sessions_lock);
     vcl2_session_t *s = vcl2_session_get (h);
+
     if (!s) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -EINVAL;
@@ -270,25 +279,25 @@ int vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return 0;
     }
-    /* rx_fifo 为 NULL（DISCONNECTED 时置 NULL，防 VPP 已清零 fifo 的 crash）：
-       * peer 已断→EOF(0)；否则 EINVAL。绝不在 NULL fifo 上 dequeue。*/
+    /* rx_fifo NULL = DISCONNECTED 置 NULL（防 VPP 已清零 fifo 的 crash）*/
     if (!s->rx_fifo) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return s->peer_closed ? 0 : -EINVAL;
     }
+
     n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
     pc = s->peer_closed;
     nb = s->nonblocking;
     clib_rwlock_reader_unlock (&vm->sessions_lock);
+
     if (n > 0)
       return n;
     if (pc)
       return 0;
     if (nb)
-      return -EAGAIN; /* 非阻塞 + 空：立即 EAGAIN */
-    /* 阻塞：app_mq_lock 内 1ms 有界重查 + 排空，锁外分发。MT 下主线程 select 共享
-       * eventfd 会偷信号，1ms 重查保证 worker 至多 1ms 重看 fifo（对齐 VCL vcl_worker_wait_mq）。
-       * peer 死→DISCONNECTED→process 置 peer_closed→下一轮 EOF。*/
+      return -EAGAIN;
+
+    /* 阻塞：1ms 有界重查 + 排空 */
     vcl2_mq_wait_dispatch (0.001);
   }
   return -ETIMEDOUT; /* not reached */
@@ -472,11 +481,13 @@ int vcl2_session_listen (vcl2_handle_t h, uint32_t q_len) {
     for (;;) {
       uint8_t done;
       int rv;
+
       clib_rwlock_reader_lock (&vm->sessions_lock);
       vcl2_session_t *s = vcl2_session_get (h);
       done = s ? s->ctrl_done : 0;
       rv = s ? s->ctrl_rv : -EINVAL;
       clib_rwlock_reader_unlock (&vm->sessions_lock);
+
       if (done) {
         clib_rwlock_writer_lock (&vm->sessions_lock);
         s = vcl2_session_get (h);
