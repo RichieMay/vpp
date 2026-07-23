@@ -25,10 +25,12 @@ typedef uint32_t vcl2_handle_t;
 #define VCL2_INVALID_HANDLE ((vcl2_handle_t) ~0)
 #define VCL2_HANDLE_IS_VALID(h) ((h) != VCL2_INVALID_HANDLE)
 
-/* 协议（与 session 层一致） */
+/* 协议（逻辑枚举；connect/listen 内部翻译为 TRANSPORT_PROTO_*）。TLS 由 VPP 终止，
+ * app 收发明文。 */
 typedef enum {
   VCL2_PROTO_TCP = 0,
   VCL2_PROTO_UDP,
+  VCL2_PROTO_TLS,
 } vcl2_proto_t;
 
 /**

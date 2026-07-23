@@ -213,7 +213,15 @@ int socket (int domain, int type, int protocol) {
   if ((domain == AF_INET || domain == AF_INET6) &&
       (t == SOCK_STREAM || t == SOCK_DGRAM) && vcl2_is_init () &&
       vcl2_main.app_index) {
-    vcl2_proto_t proto = (t == SOCK_DGRAM) ? VCL2_PROTO_UDP : VCL2_PROTO_TCP;
+    /* transparent_tls 开启时，SOCK_STREAM 建 TLS 会话（VPP 终止 TLS，app 收发明文）；
+     * SOCK_DGRAM 仍 UDP。 */
+    vcl2_proto_t proto;
+    if (t == SOCK_DGRAM)
+      proto = VCL2_PROTO_UDP;
+    else if (vcl2_main.tls_enabled)
+      proto = VCL2_PROTO_TLS;
+    else
+      proto = VCL2_PROTO_TCP;
     int h = vcl2_session_create (proto, (type & SOCK_NONBLOCK) ? 1 : 0);
     if (h < 0) {
       errno = -h;

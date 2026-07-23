@@ -92,3 +92,29 @@ svm_fifo_t *vcl2_segment_alloc_fifo (u64 handle, uword offset) {
   clib_rwlock_reader_unlock (&vm->segment_table_lock);
   return f;
 }
+
+/* 在已映射段内分配一个任意 chunk（ext_config 用），回填 chunk 指针与偏移。
+ * 镜像 VCL vcl_segment_alloc_chunk：fifo_segment_alloc_chunk_w_slice + chunk_offset。 */
+int vcl2_segment_alloc_chunk (u64 handle, u32 slice, u32 size, uword *offset,
+                              svm_fifo_chunk_t **chunk) {
+  vcl2_main_t *vm = &vcl2_main;
+  fifo_segment_t *fs;
+  uword *p;
+  svm_fifo_chunk_t *c;
+
+  clib_rwlock_reader_lock (&vm->segment_table_lock);
+  p = hash_get (vm->segment_table, handle);
+  if (PREDICT_FALSE (!p)) {
+    clib_rwlock_reader_unlock (&vm->segment_table_lock);
+    VCL2_DBG ("alloc_chunk: segment %lu not attached", (unsigned long) handle);
+    return -1;
+  }
+  fs = fifo_segment_get_segment (&vm->segment_main, p[0]);
+  c = fifo_segment_alloc_chunk_w_slice (fs, slice, size);
+  if (c) {
+    *offset = fifo_segment_chunk_offset (fs, c);
+    *chunk = c;
+  }
+  clib_rwlock_reader_unlock (&vm->segment_table_lock);
+  return c ? 0 : -1;
+}

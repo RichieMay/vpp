@@ -88,6 +88,7 @@ typedef struct {
   /* server 侧（listen/accept） */
   uint8_t is_listener; /* BOUND 后置位 */
   uint8_t is_dgram;    /* UDP：recv 用 app_recv_dgram_raw */
+  uint8_t is_tls;      /* TLS：connect/listen 用 TRANSPORT_PROTO_TLS + 挂 ext_config */
   uint8_t lcl_is_ip4;  /* bind() 存的本地地址，listen() 用 */
   uint8_t lcl_ip[16];
   uint16_t lcl_port;
@@ -138,6 +139,13 @@ typedef struct {
 
   /* 状态 */
   uint8_t is_init;
+  /* transparent_tls：VPP 终止 TLS。cert/key 经 SAPI 注册一次，ckpair_index 全局缓存；
+   * connect/listen 时据此挂 ext_config。fork 子进程清 loaded 重新注册。 */
+  uint8_t tls_enabled;     /* env VCL2_TRANSPARENT_TLS=1 */
+  uint8_t tls_cert_loaded; /* ckpair_index 已注册 */
+  uint32_t tls_ckpair_index;
+  const char *tls_cert_file;
+  const char *tls_key_file;
   /* 多线程锁（方案 C：单一共享 worker + 锁）。所有被锁结构都是【可丢弃缓存】，
    * 非跨进程资源 —— 单侧所有权不变。
    *  - segment_table_lock：保护 segment_table hash + segment_main（段映射）
@@ -178,6 +186,15 @@ u32 vcl2_segment_lookup (u64 handle);
 int vcl2_segment_attach_mq (u64 handle, uword offset, u32 idx,
                             svm_msg_q_t **mq);
 svm_fifo_t *vcl2_segment_alloc_fifo (u64 handle, uword offset);
+/* 在已映射段内分配任意 chunk（ext_config 用），返回 chunk 偏移。 */
+int vcl2_segment_alloc_chunk (u64 handle, u32 slice, u32 size, uword *offset,
+                              svm_fifo_chunk_t **chunk);
+
+/* transparent_tls（vcl2.c）：cert/key 经 SAPI 注册 VPP，拿 ckpair_index。 */
+int vcl2_tls_add_cert_key_pair (const char *cert, uint32_t cert_len,
+                                const char *key, uint32_t key_len);
+/* 懒加载：首次 TLS connect/listen 前调用，读文件 + 注册 + 缓存 index。 */
+int vcl2_tls_ensure_cert (void);
 
 /* session 缓存（vcl2_session.c） */
 vcl2_session_t *vcl2_session_get (vcl2_handle_t h);

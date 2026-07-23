@@ -286,6 +286,111 @@ failed:
   return -EINVAL;
 }
 
+/* cert/key 注册：经 SAPI 发 ADD_DEL_CERT_KEY，返回 VPP 分配的 ckpair_index（≥0）或负 errno。
+ * 镜像 vcl_sapi_add_cert_key_pair：header sendmsg + cert|key blob sendmsg + recvmsg。
+ * sapi_lock 包住全部三次（vcl2 共享单一 sapi_sock，区别于 VCL per-worker）。 */
+int vcl2_tls_add_cert_key_pair (const char *cert, uint32_t cert_len,
+                                const char *key, uint32_t key_len) {
+  vcl2_main_t *vm = &vcl2_main;
+  app_sapi_msg_t msg, rmp;
+  app_sapi_cert_key_add_del_msg_t *mp = &msg.cert_key_add_del;
+  app_sapi_cert_key_add_del_reply_msg_t *rp = &rmp.cert_key_add_del_reply;
+  clib_error_t *err;
+  u8 *blob = 0;
+  uint32_t cklen = cert_len + key_len;
+  int rv = -EIO;
+
+  if (PREDICT_FALSE (!vm->sapi_connected))
+    return -ENOTCONN;
+
+  memset (&msg, 0, sizeof (msg));
+  mp->context = vm->app_wrk_index;
+  mp->cert_len = cert_len;
+  mp->certkey_len = cklen;
+  mp->is_add = 1;
+  msg.type = APP_SAPI_MSG_TYPE_ADD_DEL_CERT_KEY;
+
+  vec_validate (blob, cklen - 1);
+  clib_memcpy_fast (blob, cert, cert_len);
+  clib_memcpy_fast (blob + cert_len, key, key_len);
+
+  pthread_mutex_lock (&vm->sapi_lock);
+  err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
+  if (err) {
+    clib_error_free (err);
+    goto done;
+  }
+  err = clib_socket_sendmsg (&vm->sapi_sock, blob, cklen, 0, 0);
+  if (err) {
+    clib_error_free (err);
+    goto done;
+  }
+  memset (&rmp, 0, sizeof (rmp));
+  err = clib_socket_recvmsg (&vm->sapi_sock, &rmp, sizeof (rmp), 0, 0);
+  if (err) {
+    clib_error_free (err);
+    goto done;
+  }
+  pthread_mutex_unlock (&vm->sapi_lock);
+
+  vec_free (blob);
+  if (PREDICT_FALSE (rmp.type != APP_SAPI_MSG_TYPE_ADD_DEL_CERT_KEY_REPLY)) {
+    VCL2_DBG ("cert_key: bad reply type %d", (int) rmp.type);
+    return -EPROTO;
+  }
+  if (PREDICT_FALSE (rp->retval)) {
+    VCL2_DBG ("cert_key add failed retval=%d", (int) rp->retval);
+    return -EINVAL;
+  }
+  VCL2_DBG ("cert_key registered index=%u", rp->index);
+  return (int) rp->index;
+
+done:
+  pthread_mutex_unlock (&vm->sapi_lock);
+  vec_free (blob);
+  return rv;
+}
+
+/* 懒加载：首次 TLS connect/listen 前调用。读 cert/key 文件 + 注册 + 缓存 index。
+ * ckpair 是 app 级（非 worker 级），fork 子进程继承 app_index 故 index 仍有效，无需重注。 */
+int vcl2_tls_ensure_cert (void) {
+  vcl2_main_t *vm = &vcl2_main;
+  char cert[8192], key[8192];
+  int cert_len, key_len, idx;
+  FILE *fp;
+
+  if (vm->tls_cert_loaded)
+    return 0;
+  if (!vm->tls_cert_file || !vm->tls_key_file) {
+    VCL2_DBG ("tls: cert/key file env not set");
+    return -ENOENT;
+  }
+
+  fp = fopen (vm->tls_cert_file, "r");
+  if (!fp) {
+    VCL2_DBG ("tls: cannot open cert %s", vm->tls_cert_file);
+    return -ENOENT;
+  }
+  cert_len = (int) fread (cert, 1, sizeof (cert), fp);
+  fclose (fp);
+
+  fp = fopen (vm->tls_key_file, "r");
+  if (!fp) {
+    VCL2_DBG ("tls: cannot open key %s", vm->tls_key_file);
+    return -ENOENT;
+  }
+  key_len = (int) fread (key, 1, sizeof (key), fp);
+  fclose (fp);
+
+  idx = vcl2_tls_add_cert_key_pair (cert, (uint32_t) cert_len, key,
+                                    (uint32_t) key_len);
+  if (idx < 0)
+    return idx;
+  vm->tls_ckpair_index = (uint32_t) idx;
+  vm->tls_cert_loaded = 1;
+  return 0;
+}
+
 /* fork child handler：子进程继承 sessions 缓存（含 listener）但需重建 SAPI 身份——
  * 开自己的 SAPI、注册为新 worker，拿到自己的 app_event_queue。在 fork() 返回前跑完。 */
 void vcl2_atfork_child (void) {
@@ -465,6 +570,25 @@ int vcl2_init (const char *app_name) {
 
   s = getenv ("VCL2_SAPI_SOCKET");
   vm->sapi_socket_path = strdup (s && s[0] ? s : VCL2_SAPI_SOCKET_DEFAULT);
+
+  /* transparent_tls：VCL2_TRANSPARENT_TLS/LDP_TRANSPARENT_TLS=1 开启；
+   * cert/key 文件接受 VCL2_ 与 LDP_ 两套名（drop-in 兼容 VCL）。cert 首次 TLS
+   * connect/listen 时懒注册（vcl2_tls_ensure_cert）。*/
+  s = getenv ("VCL2_TRANSPARENT_TLS");
+  if (!s || !s[0])
+    s = getenv ("LDP_TRANSPARENT_TLS");
+  vm->tls_enabled = (s && (s[0] == '1' || s[0] == 'y' || s[0] == 'Y')) ? 1 : 0;
+  if (vm->tls_enabled) {
+    s = getenv ("VCL2_TLS_CERT_FILE");
+    if (!s || !s[0])
+      s = getenv ("LDP_TLS_CERT_FILE");
+    vm->tls_cert_file = s && s[0] ? strdup (s) : NULL;
+    s = getenv ("VCL2_TLS_KEY_FILE");
+    if (!s || !s[0])
+      s = getenv ("LDP_TLS_KEY_FILE");
+    vm->tls_key_file = s && s[0] ? strdup (s) : NULL;
+  }
+  vm->tls_ckpair_index = ~0;
 
   /* 配置默认（P1 用默认；后续可读 VCL2_CONFIG） */
   vm->rx_fifo_size = VCL2_RX_FIFO_SIZE_DEFAULT;
