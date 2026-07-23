@@ -323,23 +323,7 @@ vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len)
       n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
       pc = s->peer_closed;
       nb = s->nonblocking;
-      /* RX 流控反馈（对齐 VCL vppcom_session_read:2370）：读出数据后，若 VPP 在 rx_fifo 上
-       * arm 了 want_deq_ntf（零窗口恢复时 VPP 会 arm），须清标志并给 VPP 发 RX IO 事件，
-       * 让 VPP 及时更新接收窗口。否则 fifo 一旦填满（零窗口）VPP 收不到 drain 通知→窗口
-       * 不重开→client stall。锁内取字段+清标志，锁外发事件（避免 send 阻塞持读锁）。*/
-      int need_ntf = 0;
-      u32 ntf_sess = 0;
-      if (n > 0 && vm->vpp_evt_q
-	  && svm_fifo_needs_deq_ntf (s->rx_fifo, n))
-	{
-	  svm_fifo_clear_deq_ntf (s->rx_fifo);
-	  ntf_sess = s->rx_fifo->vpp_session_index;
-	  need_ntf = 1;
-	}
       clib_rwlock_reader_unlock (&vm->sessions_lock);
-      if (need_ntf)
-	app_send_io_evt_to_vpp (vm->vpp_evt_q, ntf_sess,
-				SESSION_IO_EVT_RX, SVM_Q_WAIT);
       if (n > 0)
 	return n;
       if (pc)
