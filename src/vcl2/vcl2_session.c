@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <arpa/inet.h> /* htons */
 
 #include <vppinfra/clib_error.h>
@@ -157,13 +159,24 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
   mp->context = h;
   mp->wrk_index = vm->app_wrk_index;
   mp->is_ip4 = is_ip4;
-  /* UDP session：用 TRANSPORT_PROTO_UDP（检查 session 的 is_dgram） */
+  /* 记 proto（按 is_dgram）+ 对端地址（getpeername / recvfrom(TCP) 回填用，端口网络序）*/
   {
-    clib_rwlock_reader_lock (&vm->sessions_lock);
+    clib_rwlock_writer_lock (&vm->sessions_lock);
     vcl2_session_t *tmp = vcl2_session_get (h);
-    mp->proto = (tmp && tmp->is_dgram) ? TRANSPORT_PROTO_UDP
-                                       : TRANSPORT_PROTO_TCP;
-    clib_rwlock_reader_unlock (&vm->sessions_lock);
+    if (tmp) {
+      mp->proto =
+        tmp->is_dgram ? TRANSPORT_PROTO_UDP : TRANSPORT_PROTO_TCP;
+      tmp->rmt_is_ip4 = is_ip4;
+      tmp->rmt_port = htons (port);
+      if (ip) {
+        if (is_ip4)
+          memcpy (tmp->rmt_ip, ip, 4);
+        else
+          memcpy (tmp->rmt_ip, ip, 16);
+      }
+    } else
+      mp->proto = TRANSPORT_PROTO_TCP;
+    clib_rwlock_writer_unlock (&vm->sessions_lock);
   }
   mp->port = htons (port);
   if (ip) {
@@ -305,6 +318,88 @@ int vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len) {
 
     if (n > 0)
       return n;
+    if (pc)
+      return 0;
+    if (nb)
+      return -EAGAIN;
+
+    /* 阻塞：1ms 有界重查 + 排空 */
+    vcl2_mq_wait_dispatch (0.001);
+  }
+  return -ETIMEDOUT; /* not reached */
+}
+
+/* 回填源地址 sockaddr。UDP = per-packet 源（app_recv_dgram_raw 的 at）；
+ * TCP = 固定对端（at 由调用者从 session rmt 填好）。端口均为网络序。*/
+static void vcl2_fill_sockaddr (struct sockaddr *addr, socklen_t *addr_len,
+                                app_session_transport_t *at) {
+  if (at->is_ip4 && *addr_len >= sizeof (struct sockaddr_in)) {
+    struct sockaddr_in a;
+    memset (&a, 0, sizeof (a));
+    a.sin_family = AF_INET;
+    memcpy (&a.sin_addr, &at->rmt_ip.ip4, 4);
+    a.sin_port = at->rmt_port;
+    memcpy (addr, &a, sizeof (a));
+    *addr_len = sizeof (a);
+  } else if (*addr_len >= sizeof (struct sockaddr_in6)) {
+    struct sockaddr_in6 a6;
+    memset (&a6, 0, sizeof (a6));
+    a6.sin6_family = AF_INET6;
+    memcpy (&a6.sin6_addr, &at->rmt_ip.ip6, 16);
+    a6.sin6_port = at->rmt_port;
+    memcpy (addr, &a6, sizeof (a6));
+    *addr_len = sizeof (a6);
+  }
+}
+
+/* recvfrom：recv + 回填源地址。语义同 vcl2_session_recv（阻塞/非阻塞）。
+ * TCP at = session 对端；UDP at = app_recv_dgram_raw 的 per-packet 源。*/
+int vcl2_session_recvfrom (vcl2_handle_t h, void *buf, uint32_t len,
+                           struct sockaddr *addr, socklen_t *addr_len) {
+  vcl2_main_t *vm = &vcl2_main;
+  int n;
+
+  for (;;) {
+    uint8_t pc, nb;
+    app_session_transport_t at;
+
+    memset (&at, 0, sizeof (at));
+    clib_rwlock_reader_lock (&vm->sessions_lock);
+    vcl2_session_t *s = vcl2_session_get (h);
+
+    if (!s) {
+      clib_rwlock_reader_unlock (&vm->sessions_lock);
+      return -EINVAL;
+    }
+    if (s->rd_shutdown) {
+      clib_rwlock_reader_unlock (&vm->sessions_lock);
+      return 0;
+    }
+    if (PREDICT_FALSE (!s->rx_fifo)) {
+      clib_rwlock_reader_unlock (&vm->sessions_lock);
+      return s->peer_closed ? 0 : -EINVAL;
+    }
+
+    if (s->is_dgram) {
+      n = app_recv_dgram_raw (s->rx_fifo, (u8 *) buf, len, &at, 1, 0);
+    } else {
+      n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
+      at.is_ip4 = s->rmt_is_ip4;
+      at.rmt_port = s->rmt_port;
+      if (s->rmt_is_ip4)
+        memcpy (&at.rmt_ip.ip4, s->rmt_ip, 4);
+      else
+        memcpy (&at.rmt_ip.ip6, s->rmt_ip, 16);
+    }
+    pc = s->peer_closed;
+    nb = s->nonblocking;
+    clib_rwlock_reader_unlock (&vm->sessions_lock);
+
+    if (n > 0) {
+      if (addr && addr_len)
+        vcl2_fill_sockaddr (addr, addr_len, &at);
+      return n;
+    }
     if (pc)
       return 0;
     if (nb)

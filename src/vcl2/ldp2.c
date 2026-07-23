@@ -75,6 +75,10 @@ static ssize_t (*libc_recvfrom) (int, void *, size_t, int,
                                  struct sockaddr *, socklen_t *);
 static ssize_t (*libc_sendmsg) (int, const struct msghdr *, int);
 static ssize_t (*libc_recvmsg) (int, struct msghdr *, int);
+static int (*libc_socketpair) (int, int, int, int[2]);
+static int (*libc_sendmmsg) (int, struct mmsghdr *, unsigned int, int);
+static int (*libc_recvmmsg) (int, struct mmsghdr *, unsigned int, int,
+                             struct timespec *);
 
 /* 对齐 VCL ldp_socket_wrapper.c：显式 dlopen libc 解析符号，
  * 不用 RTLD_NEXT（多层 LD_PRELOAD 下后者可能解析到错误的库）。
@@ -119,6 +123,9 @@ static void ldp2_resolve_libc (void) {
   RESOLVE (recvfrom);
   RESOLVE (sendmsg);
   RESOLVE (recvmsg);
+  RESOLVE (socketpair);
+  RESOLVE (sendmmsg);
+  RESOLVE (recvmmsg);
 #undef RESOLVE
 }
 
@@ -1300,15 +1307,12 @@ ssize_t sendto (int fd, const void *buf, size_t n, int flags,
 ssize_t recvfrom (int fd, void *buf, size_t n, int flags,
                   struct sockaddr *addr, socklen_t *addr_len) {
   ldp2_init_check ();
-  if (ldp2_fd_is_vcl2 (fd)) {
-    ssize_t rv;
-    (void) flags;
-    rv = vcl2_session_recv (vcl2_fd_to_handle (fd), buf, n);
-    if (rv >= 0 && addr && addr_len)
-      ldp2_fill_name (fd, addr, addr_len, 1); /* 回填 peer 地址 */
-    return rv;
-  }
-  return libc_recvfrom (fd, buf, n, flags, addr, addr_len);
+  if (!ldp2_fd_is_vcl2 (fd))
+    return libc_recvfrom (fd, buf, n, flags, addr, addr_len);
+
+  (void) flags;
+  /* 源地址回填（UDP per-packet / TCP 对端）由数据面统一处理 */
+  return vcl2_session_recvfrom (vcl2_fd_to_handle (fd), buf, n, addr, addr_len);
 }
 
 ssize_t sendmsg (int fd, const struct msghdr *msg, int flags) {
@@ -1335,4 +1339,76 @@ ssize_t recvmsg (int fd, struct msghdr *msg, int flags) {
     return readv (fd, msg->msg_iov, msg->msg_iovlen);
   }
   return libc_recvmsg (fd, msg, flags);
+}
+
+/* ==================== 其余拦截器（对齐 VCL 符号集） ==================== */
+
+/* socketpair：仅 AF_UNIX 有意义（IPC）。AF_INET 返回 ENOSYS（对齐 VCL）。 */
+int socketpair (int domain, int type, int protocol, int fds[2]) {
+  ldp2_init_check ();
+  if (domain == AF_INET || domain == AF_INET6) {
+    errno = ENOSYS;
+    return -1;
+  }
+  return libc_socketpair (domain, type, protocol, fds);
+}
+
+/* sendmmsg：暂不支持（VCL 也是 TBD/ENOSYS）。 */
+int sendmmsg (int fd, struct mmsghdr *vmessages, unsigned int vlen, int flags) {
+  if (ldp2_fd_is_vcl2 (fd)) {
+    errno = ENOSYS;
+    return -1;
+  }
+  return libc_sendmmsg (fd, vmessages, vlen, flags);
+}
+
+/* recvmmsg：循环调 recvmsg（对齐 VCL 策略）。 */
+int recvmmsg (int fd, struct mmsghdr *vmessages, unsigned int vlen, int flags,
+              struct timespec *timeout) {
+  if (ldp2_fd_is_vcl2 (fd) && vlen > 0) {
+    unsigned int i;
+    for (i = 0; i < vlen; i++) {
+      ssize_t rv = recvmsg (fd, &vmessages[i].msg_hdr, flags);
+      if (rv < 0)
+        return i > 0 ? (int) i : -1;
+      vmessages[i].msg_len = rv;
+      if (rv == 0)
+        return (int) (i + 1);
+    }
+    return (int) vlen;
+  }
+  return libc_recvmmsg (fd, vmessages, vlen, flags, timeout);
+}
+
+/* __recv_chk：FORTIFY 辅助，bounds check 后委托 recv。 */
+ssize_t __recv_chk (int fd, void *buf, size_t buflen, size_t n, int flags) {
+  if (n > buflen) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  return recv (fd, buf, n, flags);
+}
+
+/* sendfile64：委托 sendfile（32-bit offset 兼容）。 */
+ssize_t sendfile64 (int out_fd, int in_fd, off_t *offset, size_t count) {
+  return sendfile (out_fd, in_fd, offset, count);
+}
+
+/* fcntl64：委托 fcntl（glibc 32-bit variant）。 */
+int fcntl64 (int fd, int cmd, ...) {
+  va_list ap;
+  va_start (ap, cmd);
+  int arg = (int) (long) va_arg (ap, void *);
+  va_end (ap);
+  return fcntl (fd, cmd, arg);
+}
+
+/* ppoll：委托 poll（暂忽略 sigmask，对齐 vcl2 pselect 策略）。 */
+int ppoll (struct pollfd *fds, nfds_t nfds, const struct timespec *ts,
+           const sigset_t *sigmask) {
+  (void) sigmask;
+  int timeout = -1;
+  if (ts)
+    timeout = (int) (ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
+  return poll (fds, nfds, timeout);
 }

@@ -181,6 +181,9 @@ svm_fifo_t *vcl2_segment_alloc_fifo (u64 handle, uword offset);
 
 /* session 缓存（vcl2_session.c） */
 vcl2_session_t *vcl2_session_get (vcl2_handle_t h);
+/* recvfrom：recv + 回填源地址 sockaddr（UDP per-packet / TCP 对端）。*/
+int vcl2_session_recvfrom (vcl2_handle_t h, void *buf, uint32_t len,
+                           struct sockaddr *addr, socklen_t *addr_len);
 vcl2_session_t *vcl2_session_alloc (vcl2_handle_t h);
 vcl2_session_t *vcl2_session_get_by_vpp_handle (u64 vpp_handle);
 int vcl2_session_attach_fifos (vcl2_session_t *s, u64 vpp_handle, u64 seg,
