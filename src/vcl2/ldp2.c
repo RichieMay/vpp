@@ -25,6 +25,7 @@
 #include <time.h>
 #include <signal.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h> /* TCP_INFO / TCP_CONGESTION / struct tcp_info */
 #include <stdarg.h>
 
 #include "vcl2.h"
@@ -874,25 +875,89 @@ int ioctl (int fd, unsigned long cmd, ...) {
   return libc_ioctl (fd, cmd, arg);
 }
 
-/* getsockopt：vcl2 fd 上返回合理值。SO_ERROR→0, SO_TYPE→按 session 类型。 */
+/* getsockopt：vcl2 fd 上返回合理值（app 读这些做调优/探测，给 0/garbage 会误判）。
+ * - SO_TYPE / SO_PROTOCOL / SO_ACCEPTCONN / SO_DOMAIN：按 session 状态
+ * - SO_RCVBUF / SO_SNDBUF：fifo 配置大小（app 据此开缓冲）
+ * - SO_ERROR：0（无 pending 错误；非阻塞 connect 后 nginx 会查）
+ * - TCP_INFO：零填 + tcpi_state=ESTABLISHED（字段读 0 安全）
+ * - TCP_CONGESTION："cubic"（默认算法名） */
 int getsockopt (int fd, int level, int optname, void *optval,
                 socklen_t *optlen) {
   ldp2_init_check ();
-  if (ldp2_fd_is_vcl2 (fd)) {
-    if (optval && optlen && *optlen >= (socklen_t) sizeof (int)) {
-      if (level == SOL_SOCKET && optname == SO_TYPE) {
-        vcl2_handle_t h = vcl2_fd_to_handle (fd);
-        clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
-        vcl2_session_t *s = vcl2_session_get (h);
-        *(int *) optval = (s && s->is_dgram) ? SOCK_DGRAM : SOCK_STREAM;
-        clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
-      } else {
-        *(int *) optval = 0; /* SO_ERROR / SO_DOMAIN / 各 int 型统一 0 */
-      }
-    }
+  if (!ldp2_fd_is_vcl2 (fd))
+    return libc_getsockopt (fd, level, optname, optval, optlen);
+
+  if (!optval || !optlen || *optlen < (socklen_t) sizeof (int))
     return 0;
+
+  vcl2_handle_t h = vcl2_fd_to_handle (fd);
+  int is_dgram = 0, is_listener = 0, established = 0;
+
+  clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
+  vcl2_session_t *s = vcl2_session_get (h);
+  if (s) {
+    is_dgram = s->is_dgram;
+    is_listener = s->is_listener;
+    established = s->rx_fifo && !s->peer_closed;
   }
-  return libc_getsockopt (fd, level, optname, optval, optlen);
+  clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
+
+  if (level == SOL_SOCKET) {
+    switch (optname) {
+    case SO_TYPE:
+      *(int *) optval = is_dgram ? SOCK_DGRAM : SOCK_STREAM;
+      return 0;
+    case SO_ACCEPTCONN:
+      *(int *) optval = is_listener ? 1 : 0;
+      return 0;
+    case SO_PROTOCOL:
+      *(int *) optval = is_dgram ? IPPROTO_UDP : IPPROTO_TCP;
+      return 0;
+    case SO_DOMAIN:
+      *(int *) optval = AF_INET;
+      return 0;
+    case SO_RCVBUF:
+      *(int *) optval = (int) vcl2_main.rx_fifo_size;
+      return 0;
+    case SO_SNDBUF:
+      *(int *) optval = (int) vcl2_main.tx_fifo_size;
+      return 0;
+    case SO_ERROR:
+    default:
+      *(int *) optval = 0; /* SO_ERROR 及各 int 型未特别处理项统一 0 */
+      return 0;
+    }
+  }
+
+  if (level == IPPROTO_TCP) {
+    if (optname == TCP_INFO) {
+      /* 零填 + 状态：避免 app 读到 state=0（无效）误判连接 */
+      socklen_t n = *optlen;
+      if (n > sizeof (struct tcp_info))
+        n = sizeof (struct tcp_info);
+      memset (optval, 0, n);
+      if (n >= (socklen_t) __builtin_offsetof (struct tcp_info, tcpi_state) +
+                        sizeof (uint8_t))
+        ((struct tcp_info *) optval)->tcpi_state =
+          established ? TCP_ESTABLISHED : 0;
+      *optlen = n;
+      return 0;
+    }
+    if (optname == TCP_CONGESTION) {
+      const char *algo = "cubic";
+      socklen_t need = (socklen_t) (strlen (algo) + 1);
+      if (*optlen < need) {
+        errno = ERANGE;
+        return -1;
+      }
+      memcpy (optval, algo, need);
+      *optlen = need;
+      return 0;
+    }
+  }
+
+  *(int *) optval = 0;
+  return 0;
 }
 
 /* getsockname/getpeername：从 session 缓存回填真实地址。
