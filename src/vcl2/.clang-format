@@ -1,0 +1,32 @@
+---
+# vcl2 代码风格：K&R 大括号（{ 行尾）、函数签名不折行、2 空格缩进、
+# 保留 VPP 的 foo () 调用前空格。对齐/空行由 clang-format 处理。
+BasedOnStyle: LLVM
+Language: Cpp
+
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+ColumnLimit: 80
+ContinuationIndentWidth: 2
+
+# K&R: 大括号贴在行尾
+BreakBeforeBraces: Attach
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+
+# 保留 VPP 风格：函数调用/定义/控制语句前都加空格 (foo (), if ()
+SpaceBeforeParens: Always
+
+SpaceAfterCStyleCast: true
+AlignAfterOpenBracket: Align
+BreakBeforeBinaryOperators: None
+BreakBeforeTernaryOperators: false
+SortIncludes: Never
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 2
+ReflowComments: false

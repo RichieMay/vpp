@@ -26,8 +26,7 @@ typedef uint32_t vcl2_handle_t;
 #define VCL2_HANDLE_IS_VALID(h) ((h) != VCL2_INVALID_HANDLE)
 
 /* 协议（与 session 层一致） */
-typedef enum
-{
+typedef enum {
   VCL2_PROTO_TCP = 0,
   VCL2_PROTO_UDP,
 } vcl2_proto_t;
@@ -74,8 +73,8 @@ int vcl2_session_accept (vcl2_handle_t listener_sh, vcl2_handle_t *accepted_sh);
 
 /* connect：ip 为 4/16 字节（按 is_ip4），port 为 host 字序。
  * 经 ctrl_mq 发 connect，阻塞等 VPP 的 CONNECTED 回复。0=成功。 */
-int vcl2_session_connect (vcl2_handle_t sh, uint8_t is_ip4, const uint8_t * ip,
-			  uint16_t port);
+int vcl2_session_connect (vcl2_handle_t sh, uint8_t is_ip4, const uint8_t *ip,
+                          uint16_t port);
 
 int vcl2_session_send (vcl2_handle_t sh, const void *buf, uint32_t len);
 int vcl2_session_recv (vcl2_handle_t sh, void *buf, uint32_t len);

@@ -37,32 +37,24 @@ vcl2_main_t vcl2_main;
 int vcl2_debug = 0;
 
 /* ---------- 合成 fd <-> handle 编码（LDP2 用，可丢弃缓存 key） ---------- */
-int
-vcl2_handle_to_fd (vcl2_handle_t h)
-{
+int vcl2_handle_to_fd (vcl2_handle_t h) {
   if (!VCL2_HANDLE_IS_VALID (h))
     return -EINVAL;
   return (int) vcl2_main.fd_base + (int) h;
 }
 
-vcl2_handle_t
-vcl2_fd_to_handle (int fd)
-{
+vcl2_handle_t vcl2_fd_to_handle (int fd) {
   if (fd < (int) vcl2_main.fd_base)
     return VCL2_INVALID_HANDLE;
   return (vcl2_handle_t) (fd - (int) vcl2_main.fd_base);
 }
 
-int
-vcl2_is_init (void)
-{
+int vcl2_is_init (void) {
   return vcl2_main.is_init;
 }
 
 /* ---------- SAPI UDS 连接（SEQPACKET client，复用 clib_socket） ---------- */
-int
-vcl2_sapi_connect (void)
-{
+int vcl2_sapi_connect (void) {
   vcl2_main_t *vm = &vcl2_main;
   clib_socket_t *cs = &vm->sapi_sock;
   clib_error_t *err;
@@ -72,15 +64,14 @@ vcl2_sapi_connect (void)
 
   memset (cs, 0, sizeof (*cs));
   cs->config = vm->sapi_socket_path;
-  cs->flags = CLIB_SOCKET_F_IS_CLIENT | CLIB_SOCKET_F_SEQPACKET |
-	      CLIB_SOCKET_F_BLOCKING;
+  cs->flags =
+    CLIB_SOCKET_F_IS_CLIENT | CLIB_SOCKET_F_SEQPACKET | CLIB_SOCKET_F_BLOCKING;
 
   err = clib_socket_init (cs);
-  if (err)
-    {
-      clib_error_free (err);
-      return -ECONNREFUSED;
-    }
+  if (err) {
+    clib_error_free (err);
+    return -ECONNREFUSED;
+  }
   /* SAPI socket 设 CLOEXEC（plan 要求）：app exec() 时不泄漏给子进程。
    * clib_socket_init 不设 CLOEXEC，这里补。atfork_child 关闭继承的副本并重开（也走本函数）。*/
   if (cs->fd >= 0)
@@ -93,15 +84,13 @@ vcl2_sapi_connect (void)
 /* ---------- P1：app attach（复用 app_sapi_msg_t 协议） ----------
  * 镜像 src/vcl/vcl_sapi.c:vcl_api_send_attach 的 options 设置（已验证正确）。
  */
-int
-vcl2_app_attach_locked (void)
-{
+int vcl2_app_attach_locked (void) {
   vcl2_main_t *vm = &vcl2_main;
   app_sapi_msg_t msg, rmp;
   app_sapi_attach_msg_t *mp = &msg.attach;
   app_sapi_attach_reply_msg_t *rp = &rmp.attach_reply;
   clib_error_t *err;
-  int fds[8] = { 0 };
+  int fds[8] = {0};
   int n = 0, rv;
 
   if ((rv = vcl2_sapi_connect ()))
@@ -109,7 +98,7 @@ vcl2_app_attach_locked (void)
 
   memset (&msg, 0, sizeof (msg));
   strncpy ((char *) mp->name, vm->app_name ? vm->app_name : "vcl2_app",
-	   sizeof (mp->name) - 1);
+           sizeof (mp->name) - 1);
 
   /* options[APP_OPTIONS_FLAGS]：accept-redirect + add-segment + (eventfd?)。
    * ADD_SEGMENT：VPP 为 accept 的连接另开 memfd 段时，经 APP_ADD_SEGMENT 事件
@@ -126,73 +115,67 @@ vcl2_app_attach_locked (void)
 
   msg.type = APP_SAPI_MSG_TYPE_ATTACH;
   err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
-  if (err)
-    {
-      clib_error_free (err);
-      return -EIO;
-    }
+  if (err) {
+    clib_error_free (err);
+    return -EIO;
+  }
 
   memset (&rmp, 0, sizeof (rmp));
   err = clib_socket_recvmsg (&vm->sapi_sock, &rmp, sizeof (rmp), fds,
-			     ARRAY_LEN (fds));
-  if (err)
-    {
-      clib_error_free (err);
-      return -EIO;
-    }
-  if (rmp.type != APP_SAPI_MSG_TYPE_ATTACH_REPLY)
-    {
-      VCL2_DBG ("attach: unexpected reply type %d", (int) rmp.type);
-      return -EPROTO;
-    }
-  if (rp->retval)
-    {
-      VCL2_DBG ("attach failed: retval %d", rp->retval);
-      return -EINVAL;
-    }
+                             ARRAY_LEN (fds));
+  if (err) {
+    clib_error_free (err);
+    return -EIO;
+  }
+  if (rmp.type != APP_SAPI_MSG_TYPE_ATTACH_REPLY) {
+    VCL2_DBG ("attach: unexpected reply type %d", (int) rmp.type);
+    return -EPROTO;
+  }
+  if (rp->retval) {
+    VCL2_DBG ("attach failed: retval %d", rp->retval);
+    return -EINVAL;
+  }
 
   vm->app_index = rp->app_index;
   vm->api_client_handle = rp->api_client_handle;
   vm->segment_handle = rp->segment_handle;
 
   /* 处理 VPP 返回的段 fd + mq 地址（镜像 vcl_api_attach_reply_handler） */
-  if (rp->n_fds == 0)
-    {
-      VCL2_DBG ("attach: reply carried no fds");
-      return -ENODATA;
-    }
+  if (rp->n_fds == 0) {
+    VCL2_DBG ("attach: reply carried no fds");
+    return -ENODATA;
+  }
   if (rp->fd_flags & SESSION_FD_F_VPP_MQ_SEGMENT)
-    if (vcl2_segment_attach (VCL2_VPP_WRK_SEG_HANDLE (0), "vpp-mq-seg", fds[n++]))
+    if (vcl2_segment_attach (VCL2_VPP_WRK_SEG_HANDLE (0), "vpp-mq-seg",
+                             fds[n++]))
       return -EINVAL;
-  if (rp->fd_flags & SESSION_FD_F_MEMFD_SEGMENT)
-    {
-      char name[40];
-      snprintf (name, sizeof (name), "memfd-%lu",
-		(unsigned long) rp->segment_handle);
-      if (vcl2_segment_attach (rp->segment_handle, name, fds[n++]))
-	return -EINVAL;
-    }
+  if (rp->fd_flags & SESSION_FD_F_MEMFD_SEGMENT) {
+    char name[40];
+    snprintf (name, sizeof (name), "memfd-%lu",
+              (unsigned long) rp->segment_handle);
+    if (vcl2_segment_attach (rp->segment_handle, name, fds[n++]))
+      return -EINVAL;
+  }
   /* app 事件 mq：VPP 投递事件给 app（app 轮询，不拥有） */
   if (vcl2_segment_attach_mq (rp->segment_handle, rp->app_mq, 0,
-			      &vm->app_event_queue))
+                              &vm->app_event_queue))
     return -EINVAL;
-  if (rp->fd_flags & SESSION_FD_F_MQ_EVENTFD)
-    {
-      svm_msg_q_set_eventfd (vm->app_event_queue, fds[n]);
-      /* eventfd 置非阻塞（对齐 VCL vcl_private.c:65）：否则多线程下主线程 select 的
+  if (rp->fd_flags & SESSION_FD_F_MQ_EVENTFD) {
+    svm_msg_q_set_eventfd (vm->app_event_queue, fds[n]);
+    /* eventfd 置非阻塞（对齐 VCL vcl_private.c:65）：否则多线程下主线程 select 的
        * read(efd) 与 worker svm_msg_q_timedwait 的 read(evtfd) 竞争同一计数，一方取走
        * 后另一方阻塞 read 永久挂起。svm_msg_q_timedwait 的 errno!=EAGAIN 分支专为非阻塞。*/
-      fcntl (fds[n], F_SETFL, O_NONBLOCK);
-      n++;
-    }
+    fcntl (fds[n], F_SETFL, O_NONBLOCK);
+    n++;
+  }
   /* VPP 控制 mq：session listen/connect 等请求经它 */
   if (vcl2_segment_attach_mq (VCL2_VPP_WRK_SEG_HANDLE (0), rp->vpp_ctrl_mq,
-			      rp->vpp_ctrl_mq_thread, &vm->ctrl_mq))
+                              rp->vpp_ctrl_mq_thread, &vm->ctrl_mq))
     return -EINVAL;
 
   VCL2_DBG ("attached: app_index=%u seg=%lu app_eq=%p ctrl_mq=%p",
-	    vm->app_index, (unsigned long) vm->segment_handle,
-	    vm->app_event_queue, vm->ctrl_mq);
+            vm->app_index, (unsigned long) vm->segment_handle,
+            vm->app_event_queue, vm->ctrl_mq);
 
   /* 镜像 VCL：attach 已在 VPP 侧隐式创建 worker 0（vnet_application_attach 内
    * application_alloc_worker_and_init）。本进程（master / 单进程 app）直接复用
@@ -208,25 +191,22 @@ vcl2_app_attach_locked (void)
   {
     /* 一次性注册 fork handler：子进程经 vcl2_atfork_child 重建 worker 身份 */
     static int atfork_done;
-    if (!atfork_done)
-      {
-	pthread_atfork (0, vcl2_atfork_parent, vcl2_atfork_child);
-	atfork_done = 1;
-      }
+    if (!atfork_done) {
+      pthread_atfork (0, vcl2_atfork_parent, vcl2_atfork_child);
+      atfork_done = 1;
+    }
   }
   return 0;
 }
 
 /* ---------- P1：worker 注册（fork 子进程经 atfork child handler 也调它） ---------- */
-int
-vcl2_worker_register_locked (void)
-{
+int vcl2_worker_register_locked (void) {
   vcl2_main_t *vm = &vcl2_main;
   app_sapi_msg_t msg, rmp;
   app_sapi_worker_add_del_msg_t *wp = &msg.worker_add_del;
   app_sapi_worker_add_del_reply_msg_t *rp = &rmp.worker_add_del_reply;
   clib_error_t *err;
-  int fds[8] = { 0 };
+  int fds[8] = {0};
   int n = 0, i;
 
   if (!vm->sapi_connected)
@@ -234,55 +214,48 @@ vcl2_worker_register_locked (void)
 
   memset (&msg, 0, sizeof (msg));
   wp->app_index = vm->app_index;
-  wp->wrk_index = vm->app_wrk_index;	/* 0 = 新 worker */
+  wp->wrk_index = vm->app_wrk_index; /* 0 = 新 worker */
   wp->is_add = 1;
 
   msg.type = APP_SAPI_MSG_TYPE_ADD_DEL_WORKER;
   err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
-  if (err)
-    {
-      clib_error_free (err);
-      return -EIO;
-    }
+  if (err) {
+    clib_error_free (err);
+    return -EIO;
+  }
 
   memset (&rmp, 0, sizeof (rmp));
   err = clib_socket_recvmsg (&vm->sapi_sock, &rmp, sizeof (rmp), fds,
-			     ARRAY_LEN (fds));
-  if (err)
-    {
-      clib_error_free (err);
-      return -EIO;
-    }
-  if (rmp.type != APP_SAPI_MSG_TYPE_ADD_DEL_WORKER_REPLY)
-    {
-      VCL2_DBG ("worker-add: unexpected reply type %d", (int) rmp.type);
-      return -EPROTO;
-    }
-  if (rp->retval)
-    {
-      VCL2_DBG ("worker-add failed: retval %d", rp->retval);
-      return -EINVAL;
-    }
-  if (!rp->is_add)
-    {
-      VCL2_DBG ("worker-add: reply is not an add");
-      return -EINVAL;
-    }
+                             ARRAY_LEN (fds));
+  if (err) {
+    clib_error_free (err);
+    return -EIO;
+  }
+  if (rmp.type != APP_SAPI_MSG_TYPE_ADD_DEL_WORKER_REPLY) {
+    VCL2_DBG ("worker-add: unexpected reply type %d", (int) rmp.type);
+    return -EPROTO;
+  }
+  if (rp->retval) {
+    VCL2_DBG ("worker-add failed: retval %d", rp->retval);
+    return -EINVAL;
+  }
+  if (!rp->is_add) {
+    VCL2_DBG ("worker-add: reply is not an add");
+    return -EINVAL;
+  }
 
   vm->app_wrk_index = rp->wrk_index;
   vm->api_client_handle = rp->api_client_handle;
   /* ctrl_mq 复用 attach 级别的（与 vcl 一致：worker reply 不重置 ctrl_mq） */
 
-  if (rp->segment_handle == VCL2_INVALID_SEGMENT_HANDLE)
-    {
-      VCL2_DBG ("worker-add: invalid segment handle");
-      return -EINVAL;
-    }
-  if (!rp->n_fds)
-    {
-      VCL2_DBG ("worker-add: reply carried no fds");
-      return -ENODATA;
-    }
+  if (rp->segment_handle == VCL2_INVALID_SEGMENT_HANDLE) {
+    VCL2_DBG ("worker-add: invalid segment handle");
+    return -EINVAL;
+  }
+  if (!rp->n_fds) {
+    VCL2_DBG ("worker-add: reply carried no fds");
+    return -ENODATA;
+  }
 
   /* 镜像 vcl_api_add_del_worker_reply_handler：处理 worker 专属段 fd，
    * 并把 app_event_queue 重新指向【本 worker 的】memfd 段内的队列
@@ -290,31 +263,31 @@ vcl2_worker_register_locked (void)
    *  否则 VPP 的 CONNECTED 等事件会投到本 worker 的队列、而我们仍在轮询旧队列）。 */
   if (rp->fd_flags & SESSION_FD_F_VPP_MQ_SEGMENT)
     if (vcl2_segment_attach (VCL2_VPP_WRK_SEG_HANDLE (vm->app_wrk_index),
-			     "vpp-worker-seg", fds[n++]))
+                             "vpp-worker-seg", fds[n++]))
       goto failed;
-  if (rp->fd_flags & SESSION_FD_F_MEMFD_SEGMENT)
-    {
-      char name[40];
-      snprintf (name, sizeof (name), "memfd-wrk-%lu",
-		(unsigned long) rp->segment_handle);
-      if (vcl2_segment_attach (rp->segment_handle, name, fds[n++]))
-	goto failed;
-    }
+  if (rp->fd_flags & SESSION_FD_F_MEMFD_SEGMENT) {
+    char name[40];
+    snprintf (name, sizeof (name), "memfd-wrk-%lu",
+              (unsigned long) rp->segment_handle);
+    if (vcl2_segment_attach (rp->segment_handle, name, fds[n++]))
+      goto failed;
+  }
   /* 关键：app_event_queue 重新指向本 worker 段内的队列 */
   if (vcl2_segment_attach_mq (rp->segment_handle, rp->app_event_queue_address,
-			      0, &vm->app_event_queue))
+                              0, &vm->app_event_queue))
     goto failed;
-  if (rp->fd_flags & SESSION_FD_F_MQ_EVENTFD)
-    {
-      svm_msg_q_set_eventfd (vm->app_event_queue, fds[n]);
-      fcntl (fds[n], F_SETFL, O_NONBLOCK);	/* 同 attach：eventfd 非阻塞（对齐 VCL）*/
-      n++;
-    }
+  if (rp->fd_flags & SESSION_FD_F_MQ_EVENTFD) {
+    svm_msg_q_set_eventfd (vm->app_event_queue, fds[n]);
+    fcntl (fds[n], F_SETFL,
+           O_NONBLOCK); /* 同 attach：eventfd 非阻塞（对齐 VCL）*/
+    n++;
+  }
 
   VCL2_DBG ("worker registered: wrk_index=%u client=%u seg=%lu app_eq=%p "
-	    "(n_fds=%u, used=%d)", vm->app_wrk_index, vm->api_client_handle,
-	    (unsigned long) rp->segment_handle, vm->app_event_queue,
-	    rp->n_fds, n);
+            "(n_fds=%u, used=%d)",
+            vm->app_wrk_index, vm->api_client_handle,
+            (unsigned long) rp->segment_handle, vm->app_event_queue, rp->n_fds,
+            n);
   return 0;
 
 failed:
@@ -334,9 +307,7 @@ failed:
  *
  * 在 fork() 返回给 app 前（pthread_atfork child 回调）跑完 → nginx worker 看到就绪的 vcl2。
  */
-void
-vcl2_atfork_child (void)
-{
+void vcl2_atfork_child (void) {
   vcl2_main_t *vm = &vcl2_main;
   int rv;
 
@@ -346,11 +317,10 @@ vcl2_atfork_child (void)
   vm->pid = getpid ();
 
   /* 关掉继承来的父进程 SAPI 连接（子进程的 fd 副本），开自己的 */
-  if (vm->sapi_connected)
-    {
-      clib_socket_close (&vm->sapi_sock);
-      vm->sapi_connected = 0;
-    }
+  if (vm->sapi_connected) {
+    clib_socket_close (&vm->sapi_sock);
+    vm->sapi_connected = 0;
+  }
 
   /* 重置 per-worker 状态（ctrl_mq 是 app 级，保留；app_index/config/segments/
    * sessions 缓存保留——子进程复用继承的 listener）。 */
@@ -359,18 +329,16 @@ vcl2_atfork_child (void)
   vm->app_wrk_index = 0;
   vm->api_client_handle = 0;
 
-  if ((rv = vcl2_sapi_connect ()))
-    {
-      VCL2_DBG ("atfork child: sapi reconnect failed: %d", rv);
-      return;
-    }
-  if ((rv = vcl2_worker_register_locked ()))
-    {
-      VCL2_DBG ("atfork child: worker register failed: %d", rv);
-      return;
-    }
+  if ((rv = vcl2_sapi_connect ())) {
+    VCL2_DBG ("atfork child: sapi reconnect failed: %d", rv);
+    return;
+  }
+  if ((rv = vcl2_worker_register_locked ())) {
+    VCL2_DBG ("atfork child: worker register failed: %d", rv);
+    return;
+  }
   VCL2_DBG ("atfork child re-registered: pid=%d wrk=%u client=%u",
-	    (int) vm->pid, vm->app_wrk_index, vm->api_client_handle);
+            (int) vm->pid, vm->app_wrk_index, vm->api_client_handle);
 
   /* 关键：子进程是【新】worker，不在任何 listener 的 accept 轮转位图里（al->workers）。
    * VPP 经 app_worker_start_listen 把 worker 加入位图——条件是该 worker 调过 listen。
@@ -378,15 +346,13 @@ vcl2_atfork_child (void)
    * 重发 LISTEN（同 ip/port 已绑定，VPP 仅把本 worker 加入 al->workers，不重新 bind）。 */
   {
     u32 i;
-    for (i = 0; i < vec_len (vm->sessions); i++)
-      {
-	vcl2_session_t *s = &vm->sessions[i];
-	if (s->in_use && s->is_listener)
-	  {
-	    int lrv = vcl2_session_listen (s->handle, 0);
-	    VCL2_DBG ("atfork child: re-listen handle=%u -> %d", s->handle, lrv);
-	  }
+    for (i = 0; i < vec_len (vm->sessions); i++) {
+      vcl2_session_t *s = &vm->sessions[i];
+      if (s->in_use && s->is_listener) {
+        int lrv = vcl2_session_listen (s->handle, 0);
+        VCL2_DBG ("atfork child: re-listen handle=%u -> %d", s->handle, lrv);
       }
+    }
   }
 }
 
@@ -397,9 +363,7 @@ vcl2_atfork_child (void)
  * 故 master 把自己从所有 listener 的 al->workers 摘除（unlisten），只留 worker 接受。
  * （worker 已在 child handler 里 re-listen 加入位图；pthread_atfork child 先于 parent 跑。）
  */
-void
-vcl2_atfork_parent (void)
-{
+void vcl2_atfork_parent (void) {
   vcl2_main_t *vm = &vcl2_main;
   u32 i;
   if (!vm->is_init)
@@ -412,23 +376,20 @@ vcl2_atfork_parent (void)
 /* recvmsg 一个 fd（SCM_RIGHTS）从 SAPI socket。VPP 在投 APP_ADD_SEGMENT 事件到
  * app_event_queue 之前，先经 SAPI socket sendmsg 把段 fd 推过来（空 app_sapi_msg_t +
  * 附属 fd）。处理 ADD_SEGMENT 事件时调本函数取 fd。 */
-int
-vcl2_sapi_recv_fd (int *out_fd)
-{
+int vcl2_sapi_recv_fd (int *out_fd) {
   vcl2_main_t *vm = &vcl2_main;
   app_sapi_msg_t dummy;
   clib_error_t *err;
-  int fds[1] = { 0 };
+  int fds[1] = {0};
 
   if (!vm->sapi_connected)
     return -ENOTCONN;
   err = clib_socket_recvmsg (&vm->sapi_sock, &dummy, sizeof (dummy), fds,
-			     ARRAY_LEN (fds));
-  if (err)
-    {
-      clib_error_free (err);
-      return -EIO;
-    }
+                             ARRAY_LEN (fds));
+  if (err) {
+    clib_error_free (err);
+    return -EIO;
+  }
   *out_fd = fds[0];
   return 0;
 }
@@ -444,28 +405,23 @@ vcl2_sapi_recv_fd (int *out_fd)
 #define VCL2_HEAP_SIZE (64 << 20)
 static void *vcl2_heap_base;
 
-static int
-vcl2_heap_alloc (void)
-{
+static int vcl2_heap_alloc (void) {
   void *mem, *heap;
   mem = mmap (0, VCL2_HEAP_SIZE, PROT_READ | PROT_WRITE,
-	      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (mem == MAP_FAILED)
     return -ENOMEM;
   heap = clib_mem_init (mem, VCL2_HEAP_SIZE);
-  if (!heap)
-    {
-      munmap (mem, VCL2_HEAP_SIZE);
-      vcl2_heap_base = 0;
-      return -ENOMEM;
-    }
+  if (!heap) {
+    munmap (mem, VCL2_HEAP_SIZE);
+    vcl2_heap_base = 0;
+    return -ENOMEM;
+  }
   vcl2_heap_base = mem;
   return 0;
 }
 
-int
-vcl2_init (const char *app_name)
-{
+int vcl2_init (const char *app_name) {
   vcl2_main_t *vm = &vcl2_main;
   const char *s;
   int rv;
@@ -509,9 +465,7 @@ vcl2_init (const char *app_name)
   return 0;
 }
 
-int
-vcl2_app_attach (void)
-{
+int vcl2_app_attach (void) {
   int rv;
   if (!vcl2_main.is_init)
     return -EINVAL;
@@ -521,9 +475,7 @@ vcl2_app_attach (void)
   return rv;
 }
 
-int
-vcl2_worker_register (void)
-{
+int vcl2_worker_register (void) {
   int rv;
   if (!vcl2_main.is_init)
     return -EINVAL;
@@ -531,9 +483,7 @@ vcl2_worker_register (void)
   return rv;
 }
 
-void
-vcl2_destroy (void)
-{
+void vcl2_destroy (void) {
   vcl2_main_t *vm = &vcl2_main;
   if (!vm->is_init)
     return;
@@ -542,22 +492,21 @@ vcl2_destroy (void)
    * VPP 收到后经 worker barrier 回收该 worker 的全部 session/fifo/listener/segment。
    * 这是【正常操作】的控制消息；异常退出（kill -9/segfault）不会跑到这里，由 VPP 经
    * SAPI UDS close 单侧兜底回收（已 P6 验证）。两条路径都回收，互不依赖。*/
-  if (vm->sapi_connected)
-    {
-      app_sapi_msg_t msg;
-      app_sapi_worker_add_del_msg_t *mp = &msg.worker_add_del;
-      clib_error_t *err;
-      memset (&msg, 0, sizeof (msg));
-      msg.type = APP_SAPI_MSG_TYPE_ADD_DEL_WORKER;
-      mp->app_index = vm->app_index;
-      mp->wrk_index = vm->app_wrk_index;
-      mp->is_add = 0;
-      err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
-      if (err)
-	clib_error_free (err);
-      clib_socket_close (&vm->sapi_sock);
-      vm->sapi_connected = 0;
-    }
+  if (vm->sapi_connected) {
+    app_sapi_msg_t msg;
+    app_sapi_worker_add_del_msg_t *mp = &msg.worker_add_del;
+    clib_error_t *err;
+    memset (&msg, 0, sizeof (msg));
+    msg.type = APP_SAPI_MSG_TYPE_ADD_DEL_WORKER;
+    mp->app_index = vm->app_index;
+    mp->wrk_index = vm->app_wrk_index;
+    mp->is_add = 0;
+    err = clib_socket_sendmsg (&vm->sapi_sock, &msg, sizeof (msg), 0, 0);
+    if (err)
+      clib_error_free (err);
+    clib_socket_close (&vm->sapi_sock);
+    vm->sapi_connected = 0;
+  }
 
   /* 丢弃 app 侧可丢弃缓存（进程本地；即便不 free，进程退出内核也会回收）*/
   vec_free (vm->segments);
