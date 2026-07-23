@@ -252,15 +252,15 @@ vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len)
       int have_space;
       clib_rwlock_reader_lock (&vm->sessions_lock);
       vcl2_session_t *s = vcl2_session_get (h);
-      if (!s || !s->tx_fifo)
+      if (!s)
 	{
 	  clib_rwlock_reader_unlock (&vm->sessions_lock);
 	  return -EINVAL;
 	}
-      if (s->wr_shutdown)
+      if (s->wr_shutdown || !s->tx_fifo)
 	{
 	  clib_rwlock_reader_unlock (&vm->sessions_lock);
-	  return -EPIPE;
+	  return -EPIPE;	/* wr_shutdown 或 peer 断开（tx_fifo 被 DISCONNECTED 置 NULL）*/
 	}
       if (!vm->vpp_evt_q)
 	{
@@ -303,7 +303,7 @@ vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len)
       uint8_t pc, nb;
       clib_rwlock_reader_lock (&vm->sessions_lock);
       vcl2_session_t *s = vcl2_session_get (h);
-      if (!s || !s->rx_fifo)
+      if (!s)
 	{
 	  clib_rwlock_reader_unlock (&vm->sessions_lock);
 	  return -EINVAL;
@@ -312,6 +312,13 @@ vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len)
 	{
 	  clib_rwlock_reader_unlock (&vm->sessions_lock);
 	  return 0;
+	}
+      /* rx_fifo 为 NULL（DISCONNECTED 时置 NULL，防 VPP 已清零 fifo 的 crash）：
+       * peer 已断→EOF(0)；否则 EINVAL。绝不在 NULL fifo 上 dequeue。*/
+      if (!s->rx_fifo)
+	{
+	  clib_rwlock_reader_unlock (&vm->sessions_lock);
+	  return s->peer_closed ? 0 : -EINVAL;
 	}
       n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
       pc = s->peer_closed;
@@ -694,7 +701,15 @@ vcl2_mq_wait_dispatch (double timeout_s)
 	  if (ds)
 	    {
 	      ds->peer_closed = 1;
-	      VCL2_DBG ("DISCONNECTED handle=%u vpp=0x%llx (peer_closed)",
+	      /* 【关键·crash 根因修复】peer 断开后 VPP 会释放/清零 session 的 fifo
+	       * （end_chunk→0）。在写锁内【先于 DISCONNECTED_REPLY】把 rx/tx fifo 指针
+	       * 置 NULL，使后续 recv/send 的 !fifo 检查命中、直接返回 EOF/EPIPE，绝不
+	       * 解引用已被 VPP 清零的 fifo（f_chunk_end(c=0x0) SIGSEGV）。写锁排斥所有
+	       * 正在 recv/send 的读锁持有者，故无"中途解引用"。代价：丢弃 fifo 里残留
+	       * 的尾部数据（peer 已断，可接受）。*/
+	      ds->rx_fifo = 0;
+	      ds->tx_fifo = 0;
+	      VCL2_DBG ("DISCONNECTED handle=%u vpp=0x%llx (peer_closed, fifos nulled)",
 		       ds->handle, (unsigned long long) dm->handle);
 	    }
 	  clib_rwlock_writer_unlock (&vm->sessions_lock);
