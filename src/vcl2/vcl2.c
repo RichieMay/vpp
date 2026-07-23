@@ -119,11 +119,11 @@ int vcl2_app_attach_locked (void) {
     clib_error_free (err);
     return -EIO;
   }
-  if (rmp.type != APP_SAPI_MSG_TYPE_ATTACH_REPLY) {
+  if (PREDICT_FALSE (rmp.type != APP_SAPI_MSG_TYPE_ATTACH_REPLY)) {
     VCL2_DBG ("attach: unexpected reply type %d", (int) rmp.type);
     return -EPROTO;
   }
-  if (rp->retval) {
+  if (PREDICT_FALSE (rp->retval)) {
     VCL2_DBG ("attach failed: retval %d", rp->retval);
     return -EINVAL;
   }
@@ -193,7 +193,7 @@ int vcl2_worker_register_locked (void) {
   int fds[8] = {0};
   int n = 0, i;
 
-  if (!vm->sapi_connected)
+  if (PREDICT_FALSE (!vm->sapi_connected))
     return -ENOTCONN;
 
   memset (&msg, 0, sizeof (msg));
@@ -215,15 +215,15 @@ int vcl2_worker_register_locked (void) {
     clib_error_free (err);
     return -EIO;
   }
-  if (rmp.type != APP_SAPI_MSG_TYPE_ADD_DEL_WORKER_REPLY) {
+  if (PREDICT_FALSE (rmp.type != APP_SAPI_MSG_TYPE_ADD_DEL_WORKER_REPLY)) {
     VCL2_DBG ("worker-add: unexpected reply type %d", (int) rmp.type);
     return -EPROTO;
   }
-  if (rp->retval) {
+  if (PREDICT_FALSE (rp->retval)) {
     VCL2_DBG ("worker-add failed: retval %d", rp->retval);
     return -EINVAL;
   }
-  if (!rp->is_add) {
+  if (PREDICT_FALSE (!rp->is_add)) {
     VCL2_DBG ("worker-add: reply is not an add");
     return -EINVAL;
   }
@@ -236,7 +236,7 @@ int vcl2_worker_register_locked (void) {
     VCL2_DBG ("worker-add: invalid segment handle");
     return -EINVAL;
   }
-  if (!rp->n_fds) {
+  if (PREDICT_FALSE (!rp->n_fds)) {
     VCL2_DBG ("worker-add: reply carried no fds");
     return -ENODATA;
   }
@@ -286,7 +286,7 @@ void vcl2_atfork_child (void) {
   vcl2_main_t *vm = &vcl2_main;
   int rv;
 
-  if (!vm->is_init)
+  if (PREDICT_FALSE (!vm->is_init))
     return;
 
   vm->pid = getpid ();
@@ -341,7 +341,7 @@ void vcl2_atfork_child (void) {
 void vcl2_atfork_parent (void) {
   vcl2_main_t *vm = &vcl2_main;
   u32 i;
-  if (!vm->is_init)
+  if (PREDICT_FALSE (!vm->is_init))
     return;
   for (i = 0; i < vec_len (vm->sessions); i++)
     if (vm->sessions[i].in_use && vm->sessions[i].is_listener)
@@ -357,7 +357,7 @@ int vcl2_sapi_recv_fd (int *out_fd) {
   clib_error_t *err;
   int fds[1] = {0};
 
-  if (!vm->sapi_connected)
+  if (PREDICT_FALSE (!vm->sapi_connected))
     return -ENOTCONN;
   err = clib_socket_recvmsg (&vm->sapi_sock, &dummy, sizeof (dummy), fds,
                              ARRAY_LEN (fds));
@@ -460,7 +460,7 @@ int vcl2_worker_register (void) {
 
 void vcl2_destroy (void) {
   vcl2_main_t *vm = &vcl2_main;
-  if (!vm->is_init)
+  if (PREDICT_FALSE (!vm->is_init))
     return;
 
   /* 正常优雅 detach（app 显式调用时）：向 VPP 发 ADD_DEL_WORKER(is_add=0) 回收本 worker。

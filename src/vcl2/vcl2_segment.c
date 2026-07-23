@@ -58,7 +58,7 @@ int vcl2_segment_attach_mq (u64 handle, uword offset, u32 idx,
 
   clib_rwlock_reader_lock (&vm->segment_table_lock);
   p = hash_get (vm->segment_table, handle);
-  if (!p) {
+  if (PREDICT_FALSE (!p)) {
     clib_rwlock_reader_unlock (&vm->segment_table_lock);
     VCL2_DBG ("attach_mq: segment %lu not attached", (unsigned long) handle);
     return -1;
@@ -82,7 +82,7 @@ svm_fifo_t *vcl2_segment_alloc_fifo (u64 handle, uword offset) {
 
   clib_rwlock_reader_lock (&vm->segment_table_lock);
   p = hash_get (vm->segment_table, handle);
-  if (!p) {
+  if (PREDICT_FALSE (!p)) {
     clib_rwlock_reader_unlock (&vm->segment_table_lock);
     VCL2_DBG ("alloc_fifo: segment %lu not attached", (unsigned long) handle);
     return 0;

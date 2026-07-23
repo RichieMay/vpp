@@ -100,12 +100,12 @@ int vcl2_session_attach_fifos (vcl2_session_t *s, u64 vpp_handle, u64 seg,
 
   s->rx_fifo = vcl2_segment_alloc_fifo (seg, rxf_off);
   s->tx_fifo = vcl2_segment_alloc_fifo (seg, txf_off);
-  if (!s->rx_fifo || !s->tx_fifo) {
+  if (PREDICT_FALSE (!s->rx_fifo || !s->tx_fifo)) {
     VCL2_DBG ("fifo map failed rx=%p tx=%p (seg=0x%llx)", s->rx_fifo,
               s->tx_fifo, (unsigned long long) seg);
     return -EINVAL;
   }
-  if (!vm->vpp_evt_q) {
+  if (PREDICT_FALSE (!vm->vpp_evt_q)) {
     if (vcl2_segment_attach_mq (VCL2_VPP_WRK_SEG_HANDLE (0), vpp_eq_off,
                                 mq_index, &vm->vpp_evt_q)) {
       VCL2_DBG ("vpp_evt_q attach failed");
@@ -143,7 +143,7 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
   session_connect_msg_t *mp;
   int i, et;
 
-  if (!vm->ctrl_mq || !vm->app_event_queue)
+  if (PREDICT_FALSE (!vm->ctrl_mq || !vm->app_event_queue))
     return -ENOTCONN;
   if (!VCL2_HANDLE_IS_VALID (h))
     return -EINVAL;
@@ -232,7 +232,7 @@ int vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -EPIPE;
     }
-    if (!vm->vpp_evt_q) {
+    if (PREDICT_FALSE (!vm->vpp_evt_q)) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -ENOTCONN;
     }
@@ -280,7 +280,7 @@ int vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len) {
       return 0;
     }
     /* rx_fifo NULL = DISCONNECTED 置 NULL（防 VPP 已清零 fifo 的 crash）*/
-    if (!s->rx_fifo) {
+    if (PREDICT_FALSE (!s->rx_fifo)) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return s->peer_closed ? 0 : -EINVAL;
     }
@@ -433,7 +433,7 @@ int vcl2_session_listen (vcl2_handle_t h, uint32_t q_len) {
   int i;
   (void) q_len;
 
-  if (!vm->ctrl_mq || !vm->app_event_queue)
+  if (PREDICT_FALSE (!vm->ctrl_mq || !vm->app_event_queue))
     return -ENOTCONN;
 
   /* 取 lcl 地址（读锁）填 LISTEN 消息 */
