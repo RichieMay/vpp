@@ -65,10 +65,12 @@ vcl2_session_t *vcl2_session_get (vcl2_handle_t h) {
 /* 要求：调用者持有 sessions 读锁（或写锁）。 */
 vcl2_session_t *vcl2_session_get_by_vpp_handle (u64 vpp_handle) {
   vcl2_main_t *vm = &vcl2_main;
-  u32 i;
-  for (i = 0; i < vec_len (vm->sessions); i++)
-    if (vm->sessions[i].in_use && vm->sessions[i].vpp_handle == vpp_handle)
-      return &vm->sessions[i];
+  uword *p = hash_get (vm->vpp_handle_to_session, (uword) vpp_handle);
+  if (p) {
+    vcl2_session_t *s = &vm->sessions[p[0]];
+    if (s->in_use && s->vpp_handle == vpp_handle)
+      return s;
+  }
   return 0;
 }
 
@@ -102,6 +104,8 @@ int vcl2_session_attach_fifos (vcl2_session_t *s, u64 vpp_handle, u64 seg,
 
   s->vpp_handle = vpp_handle;
   s->vpp_session_index = session_index_from_handle (vpp_handle);
+  hash_set (vm->vpp_handle_to_session, (uword) vpp_handle,
+            (uword) (s - vm->sessions));
 
   s->rx_fifo = vcl2_segment_alloc_fifo (seg, rxf_off);
   s->tx_fifo = vcl2_segment_alloc_fifo (seg, txf_off);
@@ -140,7 +144,7 @@ static int vcl2_session_attach_connected (vcl2_session_t *s,
 
 /* TLS ext_config：在 worker 段分配 chunk，写入 transport_endpt_ext_cfg_t
  * （type=CRYPTO，crypto.ckpair_index），回填 chunk 偏移。connect/listen 经 mp->ext_config
- * 传给 VPP，VPP 据此为本会话启用 TLS（终止）。镜像 VCL vcl_msg_add_ext_config。 */
+ * 传给 VPP，VPP 据此为本会话启用 TLS（终止）。镜像 VCL vcl_msg_add_ext_config。*/
 static int vcl2_session_build_ext_config (uint32_t ckpair_index, uword *offset) {
   transport_endpt_ext_cfg_t ec;
   svm_fifo_chunk_t *c;
@@ -474,6 +478,7 @@ int vcl2_session_close (vcl2_handle_t h) {
       if (cs && cs->vpp_handle) {
         vec_add1 (child_disc, cs->vpp_handle);
         hash_unset (vm->handle_to_session, (uword) s->accept_q[i]);
+        hash_unset (vm->vpp_handle_to_session, (uword) cs->vpp_handle);
         cs->in_use = 0;
         cs->rx_fifo = cs->tx_fifo = 0;
         cs->vpp_handle = 0;
@@ -482,6 +487,8 @@ int vcl2_session_close (vcl2_handle_t h) {
   }
 
   hash_unset (vm->handle_to_session, (uword) h);
+  if (vpp_handle)
+    hash_unset (vm->vpp_handle_to_session, (uword) vpp_handle);
   vec_free (s->accept_q);
   s->in_use = 0;
   s->rx_fifo = s->tx_fifo = 0;
@@ -865,6 +872,13 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
           else
             memcpy (ns->rmt_ip, &am->rmt.ip, 16);
           ns->rmt_port = am->rmt.port;
+          /* 本地地址（getsockname 用）：端口网络序原样拷 */
+          ns->lcl_is_ip4 = am->lcl.is_ip4;
+          ns->lcl_port = am->lcl.port;
+          if (am->lcl.is_ip4)
+            memcpy (ns->lcl_ip, &am->lcl.ip.ip4, 4);
+          else
+            memcpy (ns->lcl_ip, &am->lcl.ip, 16);
           if (!vcl2_session_attach_fifos (
                 ns, am->handle, am->segment_handle, am->server_rx_fifo,
                 am->server_tx_fifo, am->vpp_event_queue_address,
@@ -890,8 +904,16 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
       if (cs) {
         if (cm->retval)
           cs->ctrl_rv = (int) cm->retval;
-        else
+        else {
           cs->ctrl_rv = vcl2_session_attach_connected (cs, cm);
+          /* 回填本地地址（getsockname 用）：端口网络序，照 rmt 原样拷 */
+          cs->lcl_is_ip4 = cm->lcl.is_ip4;
+          cs->lcl_port = cm->lcl.port;
+          if (cm->lcl.is_ip4)
+            memcpy (cs->lcl_ip, &cm->lcl.ip.ip4, 4);
+          else
+            memcpy (cs->lcl_ip, &cm->lcl.ip, 16);
+        }
         cs->ctrl_done = 1;
         VCL2_DBG ("CONNECTED handle=%u rv=%d", cs->handle, cs->ctrl_rv);
       }
@@ -908,6 +930,9 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
           bs->vpp_handle = bm->handle;
           bs->is_listener = 1;
           bs->ctrl_rv = 0;
+          /* listener 的 vpp_handle 也登记反向 hash（ACCEPTED 按 listener_handle 查它）*/
+          hash_set (vm->vpp_handle_to_session, (uword) bm->handle,
+                    (uword) (bs - vm->sessions));
         }
         bs->ctrl_done = 1;
         VCL2_DBG ("BOUND handle=%u rv=%d", bs->handle, bs->ctrl_rv);

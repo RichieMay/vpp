@@ -133,6 +133,7 @@ typedef struct {
   /* 可丢弃 session 缓存（recv/send 用，非资源所有权） */
   vcl2_session_t *sessions;
   uword *handle_to_session; /* hash: handle -> sessions[] index */
+  uword *vpp_handle_to_session; /* hash: vpp_handle -> sessions[] index（dispatch 查找用）*/
 
   /* 数据面映射（VPP-owned，app 只 mmap） */
   vcl2_segment_t *segments;

@@ -655,6 +655,7 @@ void vcl2_destroy (void) {
   vec_free (vm->segments);
   vec_free (vm->sessions);
   hash_free (vm->handle_to_session);
+  hash_free (vm->vpp_handle_to_session);
   free (vm->app_name);
   free (vm->sapi_socket_path);
   clib_rwlock_free (&vm->segment_table_lock);
