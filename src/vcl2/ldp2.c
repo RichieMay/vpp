@@ -516,7 +516,9 @@ static void ldp2_drain_app_events (void) {
  * 数据 session：rx 有数据→IN，tx 有空间→OUT。 */
 static uint32_t ldp2_session_ready (vcl2_session_t *s, uint32_t want) {
   uint32_t ev = 0;
-  if (s->is_listener) {
+  /* TCP listener：accept_q 有待取子 session 才就绪。
+   * UDP listener（is_dgram）本身就是数据 session（直接收数据报），落入下方 rx_fifo 检查。*/
+  if (s->is_listener && !s->is_dgram) {
     if ((want & EPOLLIN) && vec_len (s->accept_q) > 0)
       ev |= EPOLLIN;
     return ev;
@@ -693,32 +695,48 @@ int epoll_pwait (int epfd, struct epoll_event *events, int maxevents,
  */
 
 int bind (int fd, const struct sockaddr *addr, socklen_t len) {
+  vcl2_handle_t h;
+  uint8_t is_dgram;
   ldp2_init_check ();
-  if (ldp2_fd_is_vcl2 (fd) && addr) {
-    /* 写锁：存 lcl 地址进 session（mutate） */
-    clib_rwlock_writer_lock (&vcl2_main.sessions_lock);
-    vcl2_session_t *s = vcl2_session_get (vcl2_fd_to_handle (fd));
-    if (!s) {
-      clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
-      errno = EBADF;
-      return -1;
-    }
-    if (addr->sa_family == AF_INET && len >= sizeof (struct sockaddr_in)) {
-      const struct sockaddr_in *a = (const struct sockaddr_in *) addr;
-      s->lcl_is_ip4 = 1;
-      memcpy (s->lcl_ip, &a->sin_addr, 4);
-      s->lcl_port = ntohs (a->sin_port);
-    } else if (addr->sa_family == AF_INET6 &&
-               len >= sizeof (struct sockaddr_in6)) {
-      const struct sockaddr_in6 *a = (const struct sockaddr_in6 *) addr;
-      s->lcl_is_ip4 = 0;
-      memcpy (s->lcl_ip, &a->sin6_addr, 16);
-      s->lcl_port = ntohs (a->sin6_port);
-    }
+  if (!ldp2_fd_is_vcl2 (fd) || !addr)
+    return libc_bind (fd, addr, len);
+  h = vcl2_fd_to_handle (fd);
+
+  /* 写锁：存 lcl 地址进 session（mutate） */
+  clib_rwlock_writer_lock (&vcl2_main.sessions_lock);
+  vcl2_session_t *s = vcl2_session_get (h);
+  if (!s) {
     clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
-    return 0;
+    errno = EBADF;
+    return -1;
   }
-  return libc_bind (fd, addr, len);
+  if (addr->sa_family == AF_INET && len >= sizeof (struct sockaddr_in)) {
+    const struct sockaddr_in *a = (const struct sockaddr_in *) addr;
+    s->lcl_is_ip4 = 1;
+    memcpy (s->lcl_ip, &a->sin_addr, 4);
+    s->lcl_port = ntohs (a->sin_port);
+  } else if (addr->sa_family == AF_INET6 &&
+             len >= sizeof (struct sockaddr_in6)) {
+    const struct sockaddr_in6 *a = (const struct sockaddr_in6 *) addr;
+    s->lcl_is_ip4 = 0;
+    memcpy (s->lcl_ip, &a->sin6_addr, 16);
+    s->lcl_port = ntohs (a->sin6_port);
+  }
+  is_dgram = s->is_dgram;
+  clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
+
+  /* UDP：bind 即自动 listen（对齐 VCL vppcom_session_bind 的 UDP 分支）——
+   * VPP 据此建立 connectionless UDP session + 投递数据报（BOUND 带 fifos）。
+   * 否则 bound 的 UDP session 无 rx_fifo，recvfrom 立即返 -EINVAL。*/
+  if (is_dgram) {
+    int rv = vcl2_session_listen (h, 10);
+    if (rv < 0)
+      {
+        errno = -rv;
+        return -1;
+      }
+  }
+  return 0;
 }
 
 int listen (int fd, int backlog) {
@@ -1342,34 +1360,55 @@ ssize_t sendto (int fd, const void *buf, size_t n, int flags,
   h = vcl2_fd_to_handle (fd);
   (void) flags;
 
-  /* UDP 未连接 + 有目标地址：懒 connect 到该地址 */
+  /* UDP + 有目标地址：未连接则懒 connect（会设 rmt）；已连接/listening 则把 rmt
+   * 设为本次 sendto 的目标（connectionless 每包可不同对端）。dgram 头据 rmt 投递。*/
   if (addr && addr_len >= sizeof (struct sockaddr_in)) {
+    uint8_t ip[16], is_ip4 = 0, is_dgram = 0, need_connect = 0;
+    uint16_t port = 0;
+    const struct sockaddr_in *a4 = (const struct sockaddr_in *) addr;
+    if (a4->sin_family == AF_INET) {
+      is_ip4 = 1;
+      memcpy (ip, &a4->sin_addr, 4);
+      port = a4->sin_port;
+    } else if (addr_len >= sizeof (struct sockaddr_in6)) {
+      const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *) addr;
+      is_ip4 = 0;
+      memcpy (ip, &a6->sin6_addr, 16);
+      port = a6->sin6_port;
+    } else {
+      errno = EAFNOSUPPORT;
+      return -1;
+    }
+
+    uint8_t is_listener = 0;
     clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
     vcl2_session_t *s = vcl2_session_get (h);
-    uint8_t need_connect = (s && s->is_dgram && !s->vpp_handle);
+    if (s && s->is_dgram) {
+      is_dgram = 1;
+      is_listener = s->is_listener;
+      /* 未连接且非 listener（未 bind）才懒 connect。UDP connectionless listener
+       * 的 vpp_handle 合法为 0（VPP 约定），不能据此判断。*/
+      need_connect = !s->vpp_handle && !is_listener;
+    }
     clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
 
-    if (need_connect) {
-      const struct sockaddr_in *a4 = (const struct sockaddr_in *) addr;
-      uint8_t ip[16], is_ip4;
-      uint16_t port;
-      if (a4->sin_family == AF_INET) {
-        is_ip4 = 1;
-        memcpy (ip, &a4->sin_addr, 4);
-        port = a4->sin_port;
-      } else if (addr_len >= sizeof (struct sockaddr_in6)) {
-        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *) addr;
-        is_ip4 = 0;
-        memcpy (ip, &a6->sin6_addr, 16);
-        port = a6->sin6_port;
+    if (is_dgram) {
+      if (need_connect) {
+        int rv = vcl2_session_connect (h, is_ip4, ip, port);
+        if (rv < 0) {
+          errno = -rv;
+          return -1;
+        }
       } else {
-        errno = EAFNOSUPPORT;
-        return -1;
-      }
-      int rv = vcl2_session_connect (h, is_ip4, ip, port);
-      if (rv < 0) {
-        errno = -rv;
-        return -1;
+        /* 已连接/listening UDP：设 rmt 供 dgram 头用（端口网络序）*/
+        clib_rwlock_writer_lock (&vcl2_main.sessions_lock);
+        s = vcl2_session_get (h);
+        if (s) {
+          s->rmt_is_ip4 = is_ip4;
+          s->rmt_port = port;
+          memcpy (s->rmt_ip, ip, is_ip4 ? 4 : 16);
+        }
+        clib_rwlock_writer_unlock (&vcl2_main.sessions_lock);
       }
     }
   }

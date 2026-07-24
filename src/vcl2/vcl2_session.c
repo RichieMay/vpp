@@ -279,7 +279,7 @@ int vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len) {
     return 0;
 
   for (;;) {
-    int have_space;
+    int have_space, overhead;
 
     clib_rwlock_reader_lock (&vm->sessions_lock);
     vcl2_session_t *s = vcl2_session_get (h);
@@ -297,15 +297,35 @@ int vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len) {
       return -ENOTCONN;
     }
 
-    have_space = svm_fifo_max_enqueue_prod (s->tx_fifo) >= (int) len;
+    overhead = s->is_dgram ? SESSION_CONN_HDR_LEN : 0;
+    have_space = svm_fifo_max_enqueue_prod (s->tx_fifo) >= (int) len + overhead;
     if (s->nonblocking && !have_space) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -EAGAIN;
     }
 
     if (have_space) {
-      n = app_send_stream_raw (s->tx_fifo, vm->vpp_evt_q, (u8 *) buf, len,
-                               SESSION_IO_EVT_TX, 1, 0);
+      if (s->is_dgram) {
+        /* dgram：dest = session rmt（sendto/connect 设），lcl = 本地。
+         * 每个 dgram 带 dgram 头，VPP 据头里的 rmt 投递到对端。*/
+        app_session_transport_t at;
+        memset (&at, 0, sizeof (at));
+        at.is_ip4 = s->rmt_is_ip4;
+        at.rmt_port = s->rmt_port;
+        if (s->rmt_is_ip4)
+          memcpy (&at.rmt_ip.ip4, s->rmt_ip, 4);
+        else
+          memcpy (&at.rmt_ip.ip6, s->rmt_ip, 16);
+        at.lcl_port = htons (s->lcl_port);
+        if (s->lcl_is_ip4)
+          memcpy (&at.lcl_ip.ip4, s->lcl_ip, 4);
+        else
+          memcpy (&at.lcl_ip.ip6, s->lcl_ip, 16);
+        n = app_send_dgram_raw (s->tx_fifo, &at, vm->vpp_evt_q, (u8 *) buf,
+                                len, SESSION_IO_EVT_TX, 1, 0);
+      } else
+        n = app_send_stream_raw (s->tx_fifo, vm->vpp_evt_q, (u8 *) buf, len,
+                                 SESSION_IO_EVT_TX, 1, 0);
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return n < 0 ? -EAGAIN : n;
     }
@@ -933,9 +953,30 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
           /* listener 的 vpp_handle 也登记反向 hash（ACCEPTED 按 listener_handle 查它）*/
           hash_set (vm->vpp_handle_to_session, (uword) bm->handle,
                     (uword) (bs - vm->sessions));
+          /* BOUND 带 rx/tx fifo（对齐 VCL vcl_session_bound_handler 的
+           * vcl_segment_attach_session）。UDP listener 据此 recvfrom；TCP listener
+           * 的 fifo 不用（数据走子 session），无害。rx_fifo==0 则跳过。*/
+          if (bm->rx_fifo) {
+            bs->ctrl_rv = vcl2_session_attach_fifos (
+              bs, bm->handle, bm->segment_handle, bm->rx_fifo, bm->tx_fifo,
+              bm->vpp_evt_q, bm->mq_index);
+            /* connectionless（UDP）listener 的数据面身份是 cl_sh_handle，不是
+             * listener handle（后者为 0）。attach_fifos 按 listener handle 设了
+             * vpp_session_index=0（错）；此处改用 cl_sh_handle（对齐 VCL 的
+             * fifo->vpp_sh = cl_sh_handle），否则 tx 通知引用错误 session →
+             * 数据报发不出。*/
+            if (bs->is_dgram && bm->cl_sh_handle) {
+              u32 cl_idx = session_index_from_handle (bm->cl_sh_handle);
+              bs->rx_fifo->vpp_sh = bm->cl_sh_handle;
+              bs->tx_fifo->vpp_sh = bm->cl_sh_handle;
+              bs->rx_fifo->vpp_session_index = cl_idx;
+              bs->tx_fifo->vpp_session_index = cl_idx;
+            }
+          }
         }
         bs->ctrl_done = 1;
-        VCL2_DBG ("BOUND handle=%u rv=%d", bs->handle, bs->ctrl_rv);
+        VCL2_DBG ("BOUND handle=%u vpp=0x%llx rv=%d", bs->handle,
+                  (unsigned long long) bm->handle, bs->ctrl_rv);
       }
       clib_rwlock_writer_unlock (&vm->sessions_lock);
     } else if (e->event_type == SESSION_CTRL_EVT_UNLISTEN_REPLY) {
