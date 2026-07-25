@@ -168,12 +168,85 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
   vcl2_main_t *vm = &vcl2_main;
   app_session_evt_t app_evt;
   session_connect_msg_t *mp;
-  int i, et;
+  uint8_t proto = TRANSPORT_PROTO_TCP, is_tls = 0;
+  uword tls_ext_off = 0;
 
   if (PREDICT_FALSE (!vm->ctrl_mq || !vm->app_event_queue))
     return -ENOTCONN;
   if (!VCL2_HANDLE_IS_VALID (h))
     return -EINVAL;
+
+  /* 写锁内：取 proto（is_dgram/is_tls 三选一）+ 记对端地址；UDP listener→connect 时
+   * 先撤销 listener 身份 + 登记 UNLISTEN。*/
+  uint8_t need_unlisten = 0;
+  uint64_t unlisten_vh = 0;
+  uint16_t lcl_port = 0;
+  uint8_t lcl_ip[16];
+  uint8_t lcl_is_ip4 = 0;
+  clib_rwlock_writer_lock (&vm->sessions_lock);
+  vcl2_session_t *tmp = vcl2_session_get (h);
+  if (!tmp) {
+    clib_rwlock_writer_unlock (&vm->sessions_lock);
+    return -EINVAL;
+  }
+  proto = tmp->is_dgram ? TRANSPORT_PROTO_UDP :
+                          (tmp->is_tls ? TRANSPORT_PROTO_TLS :
+                                         TRANSPORT_PROTO_TCP);
+  is_tls = tmp->is_tls;
+  tmp->rmt_is_ip4 = is_ip4;
+  tmp->rmt_port = htons (port);
+  if (ip)
+    memcpy (tmp->rmt_ip, ip, is_ip4 ? 4 : 16);
+  /* 本地地址（CONNECT 的源地址 = mp->lcl_*；iperf3 -u 把已 bind 的 listener connect 给
+   * 客户端时，连接会话必须保留原源端口 5201，否则 VPP 分配临时端口 → 客户端发 5201 的
+   * 数据落不到该会话。未 bind 时为 0 → VPP 自选。镜像 VCL vcl_send_session_connect。*/
+  lcl_port = tmp->lcl_port;
+  lcl_is_ip4 = tmp->lcl_is_ip4;
+  memcpy (lcl_ip, tmp->lcl_ip, 16);
+  /* 连接无连接 UDP listener：先 UNLISTEN 释放端口（镜像 VCL vppcom_session_connect 的
+   * LISTEN-state 分支）。iperf3 -u 服务端 iperf_udp_accept 先 connect(listener,peer) 再
+   * netannounce 同端口新 listener；不先 UNLISTEN 旧 listener 则 VPP 端口仍占用 → 新 LISTEN
+   * 返 PORTINUSE(-17) → 测试挂起。TCP listener connect 返 EINVAL（镜像 VCL）。*/
+  if (tmp->is_listener) {
+    if (!tmp->is_dgram) {
+      clib_rwlock_writer_unlock (&vm->sessions_lock);
+      return -EINVAL;
+    }
+    unlisten_vh = tmp->vpp_handle;
+    if (unlisten_vh) {
+      hash_unset (vm->vpp_handle_to_session, (uword) unlisten_vh);
+      tmp->vpp_handle = 0;
+    }
+    tmp->is_listener = 0;
+    need_unlisten = 1;
+  }
+  clib_rwlock_writer_unlock (&vm->sessions_lock);
+
+  /* 锁外：先发 UNLISTEN（异步；依赖 ctrl_mq FIFO——先于 CONNECT 入队 → VPP 先处理 → 端口
+   * 释放后 CONNECT 才建连，随后 iperf3 netannounce 的 LISTEN 才能绑同端口成功）。*/
+  if (need_unlisten && unlisten_vh) {
+    app_session_evt_t uae;
+    session_unlisten_msg_t *ump;
+    app_alloc_ctrl_evt_to_vpp (vm->ctrl_mq, &uae, SESSION_CTRL_EVT_UNLISTEN);
+    ump = (session_unlisten_msg_t *) uae.evt->data;
+    memset (ump, 0, sizeof (*ump));
+    ump->client_index = vm->api_client_handle;
+    ump->context = h;
+    ump->wrk_index = vm->app_wrk_index;
+    ump->handle = unlisten_vh;
+    app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &uae);
+    VCL2_DBG ("connect: UNLISTEN old listener vpp=0x%llx (free port)",
+              (unsigned long long) unlisten_vh);
+  }
+
+  /* TLS：确保 cert 已注册，挂 ext_config（crypto.ckpair_index）到 worker 段 chunk */
+  if (is_tls) {
+    int erv = vcl2_tls_ensure_cert ();
+    if (erv)
+      return erv;
+    if (vcl2_session_build_ext_config (vm->tls_ckpair_index, &tls_ext_off))
+      return -ENOMEM;
+  }
 
   memset (&app_evt, 0, sizeof (app_evt));
   app_alloc_ctrl_evt_to_vpp (vm->ctrl_mq, &app_evt, SESSION_CTRL_EVT_CONNECT);
@@ -183,40 +256,7 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
   mp->context = h;
   mp->wrk_index = vm->app_wrk_index;
   mp->is_ip4 = is_ip4;
-  /* 记 proto（按 is_dgram/is_tls 三选一）+ 对端地址。TLS 的 ext_config 锁外挂。*/
-  {
-    uint8_t is_tls = 0;
-    clib_rwlock_writer_lock (&vm->sessions_lock);
-    vcl2_session_t *tmp = vcl2_session_get (h);
-    if (tmp) {
-      mp->proto =
-        tmp->is_dgram ? TRANSPORT_PROTO_UDP :
-                        (tmp->is_tls ? TRANSPORT_PROTO_TLS :
-                                       TRANSPORT_PROTO_TCP);
-      is_tls = tmp->is_tls;
-      tmp->rmt_is_ip4 = is_ip4;
-      tmp->rmt_port = htons (port);
-      if (ip) {
-        if (is_ip4)
-          memcpy (tmp->rmt_ip, ip, 4);
-        else
-          memcpy (tmp->rmt_ip, ip, 16);
-      }
-    } else
-      mp->proto = TRANSPORT_PROTO_TCP;
-    clib_rwlock_writer_unlock (&vm->sessions_lock);
-
-    /* TLS：确保 cert 已注册，挂 ext_config（crypto.ckpair_index）到 worker 段 chunk */
-    if (is_tls) {
-      uword off;
-      int erv = vcl2_tls_ensure_cert ();
-      if (erv)
-        return erv;
-      if (vcl2_session_build_ext_config (vm->tls_ckpair_index, &off))
-        return -ENOMEM;
-      mp->ext_config = off;
-    }
-  }
+  mp->proto = proto;
   mp->port = htons (port);
   if (ip) {
     /* ipv4 存在 ip46 offset 12（pad[3] 之后），必须用 set_ip4 */
@@ -225,6 +265,15 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
     else
       clib_memcpy_fast (&mp->ip, ip, 16);
   }
+  /* 源地址：bind 过则保留（iperf3 -u 的 5201），否则 0 由 VPP 自选。镜像 VCL。*/
+  mp->lcl_port = htons (lcl_port);
+  if (lcl_is_ip4)
+    ip46_address_set_ip4 (&mp->lcl_ip, (const ip4_address_t *) lcl_ip);
+  else
+    clib_memcpy_fast (&mp->lcl_ip, lcl_ip, 16);
+  mp->flags |= TRANSPORT_CFG_F_CONNECTED;
+  if (is_tls)
+    mp->ext_config = tls_ext_off;
   app_send_ctrl_evt_to_vpp (vm->ctrl_mq, &app_evt);
 
   /* 事件驱动等 CONNECTED：dispatch 统一处理所有事件类型（含 CONNECTED，置 ctrl_done），
