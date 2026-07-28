@@ -31,6 +31,14 @@
 #include "vcl2.h"
 #include "vcl2_private.h"
 
+/* 多路复用器(select/poll/epoll_wait)阻塞等待的上限(ms)。每到此值重排空 app_event_queue +
+ * 重扫各 session fifo——独立于 eventfd 信号。镜像阻塞 recv 路径的 1ms 有界重查(vcl2_session.c)：
+ * recv 路径靠 1ms 重查掩盖了 eventfd 偶发丢信号；多路复用器此前用【完整剩余超时】阻塞在 eventfd
+ * 上，一旦 VPP 的 eventfd 信号在该路径上未可靠到达(实测 app_event_queue cursize>0 但 eventfd count=0，
+ * 服务端卡在 select → 无 interval → 控制通道超时断 → receiver 0/0)，便长期不重扫。封顶后最多
+ * N ms 重扫一次，兜底所有漏信号场景。代价：空闲时 ~每 N ms 一次空排空+扫描(廉价)。 */
+#define VCL2_MUX_RECHECK_MS 100
+
 #define LDP2_DBG(...)                                                          \
   do {                                                                         \
     if (vcl2_debug) {                                                          \
@@ -653,7 +661,7 @@ int epoll_wait (int epfd, struct epoll_event *events, int maxevents,
       return n;
 
     if (deadline_ms < 0)
-      t = -1;
+      t = VCL2_MUX_RECHECK_MS;
     else {
       struct timespec now;
       long now_ms;
@@ -662,6 +670,8 @@ int epoll_wait (int epfd, struct epoll_event *events, int maxevents,
       if (now_ms >= deadline_ms)
         return 0;
       t = (int) (deadline_ms - now_ms);
+      if (t > VCL2_MUX_RECHECK_MS || t < 0)
+        t = VCL2_MUX_RECHECK_MS;
     }
 
     m = libc_epoll_wait (ep->libc_epfd, tmp, tmpcap, t);
@@ -1139,7 +1149,7 @@ int poll (struct pollfd *fds, nfds_t nfds, int timeout) {
     rp[nr].revents = 0;
     map[nr] = -1; /* 标记 eventfd 槽 */
     if (deadline_ms < 0)
-      t = -1;
+      t = VCL2_MUX_RECHECK_MS;
     else {
       struct timespec now;
       long now_ms;
@@ -1151,6 +1161,8 @@ int poll (struct pollfd *fds, nfds_t nfds, int timeout) {
         return 0;
       }
       t = (int) (deadline_ms - now_ms);
+      if (t > VCL2_MUX_RECHECK_MS || t < 0)
+        t = VCL2_MUX_RECHECK_MS;
     }
     libc_poll (rp, nr + 1, t);
     if (rp[nr].revents & POLLIN) {
@@ -1282,7 +1294,7 @@ int select (int nfds, fd_set *rset, fd_set *wset, fd_set *eset,
       sel_nfds = efd + 1;
     FD_SET (efd, &tr); /* eventfd 加入读集 */
     if (deadline_ms < 0)
-      wait_ms = -1;
+      wait_ms = VCL2_MUX_RECHECK_MS;
     else {
       struct timespec now;
       long now_ms;
@@ -1298,6 +1310,8 @@ int select (int nfds, fd_set *rset, fd_set *wset, fd_set *eset,
         return 0;
       }
       wait_ms = (int) (deadline_ms - now_ms);
+      if (wait_ms > VCL2_MUX_RECHECK_MS)
+        wait_ms = VCL2_MUX_RECHECK_MS;
     }
     {
       struct timeval wtv;
