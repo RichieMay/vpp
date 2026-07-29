@@ -114,13 +114,21 @@ int vcl2_session_attach_fifos (vcl2_session_t *s, u64 vpp_handle, u64 seg,
               s->tx_fifo, (unsigned long long) seg);
     return -EINVAL;
   }
-  if (PREDICT_FALSE (!vm->vpp_evt_q)) {
-    if (vcl2_segment_attach_mq (VCL2_VPP_WRK_SEG_HANDLE (0), vpp_eq_off,
-                                mq_index, &vm->vpp_evt_q)) {
-      VCL2_DBG ("vpp_evt_q attach failed");
-      return -EINVAL;
-    }
+  /* 【多核修复】每个 session 绑定【自己的】RX mq：vpp_eq_off/mq_index 指向该
+   * session 所属 VPP worker 线程的 mq（CONNECTED/ACCEPTED/BOUND 回复各带）。
+   * send/DISCONNECT/SHUTDOWN/ACCEPTED_REPLY 等经它回 VPP，落在正确线程，
+   * 否则 app_worker_add_event 断言 s->thread_index==cur 触发 panic。
+   * vpp_eq_off/mq_index 此前只在首次回填了【全局】vm->vpp_evt_q（= 某一个线程），
+   * 多核 RSS 下其余线程的 session 用它即错线程。 */
+  if (vcl2_segment_attach_mq (VCL2_VPP_WRK_SEG_HANDLE (0), vpp_eq_off,
+                              mq_index, &s->vpp_evt_q)) {
+    VCL2_DBG ("per-session vpp_evt_q attach failed (seg=0x%llx off=%lu)",
+              (unsigned long long) seg, (unsigned long) vpp_eq_off);
+    s->vpp_evt_q = vm->vpp_evt_q; /* 回退全局（兼容单核/早期） */
   }
+  /* 兼容：全局 vpp_evt_q 首次初始化（个别早期路径仍引用它作回退） */
+  if (PREDICT_FALSE (!vm->vpp_evt_q))
+    vm->vpp_evt_q = s->vpp_evt_q;
   s->rx_fifo->vpp_session_index = s->vpp_session_index;
   s->tx_fifo->vpp_session_index = s->vpp_session_index;
   s->rx_fifo->segment_index = vcl2_segment_lookup (seg);
@@ -341,7 +349,7 @@ int vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -EPIPE;
     }
-    if (PREDICT_FALSE (!vm->vpp_evt_q)) {
+    if (PREDICT_FALSE (!s->vpp_evt_q)) {
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return -ENOTCONN;
     }
@@ -370,10 +378,10 @@ int vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len) {
           memcpy (&at.lcl_ip.ip4, s->lcl_ip, 4);
         else
           memcpy (&at.lcl_ip.ip6, s->lcl_ip, 16);
-        n = app_send_dgram_raw (s->tx_fifo, &at, vm->vpp_evt_q, (u8 *) buf,
+        n = app_send_dgram_raw (s->tx_fifo, &at, s->vpp_evt_q, (u8 *) buf,
                                 len, SESSION_IO_EVT_TX, 1, 0);
       } else
-        n = app_send_stream_raw (s->tx_fifo, vm->vpp_evt_q, (u8 *) buf, len,
+        n = app_send_stream_raw (s->tx_fifo, s->vpp_evt_q, (u8 *) buf, len,
                                  SESSION_IO_EVT_TX, 1, 0);
       clib_rwlock_reader_unlock (&vm->sessions_lock);
       return n < 0 ? -EAGAIN : n;
@@ -524,7 +532,11 @@ int vcl2_session_recvfrom (vcl2_handle_t h, void *buf, uint32_t len,
  */
 int vcl2_session_close (vcl2_handle_t h) {
   vcl2_main_t *vm = &vcl2_main;
-  u64 *child_disc = NULL; /* accept_q 子 session 的 vpp_handle，锁外发 DISCONNECT */
+  /* 子 session 的 DISCONNECT 必须各经其【所属线程】的 evt_q 发回（多核 RSS），
+   * 故连 evt_q 一起缓存，锁外逐个发送。 */
+  struct { uint64_t vpp_handle; svm_msg_q_t *evt_q; } *child_disc = NULL,
+                                                                 cd_ent;
+  svm_msg_q_t *disc_mq = 0; /* 本 session 的 evt_q（非 listener DISCONNECT 用） */
 
   clib_rwlock_writer_lock (&vm->sessions_lock);
   vcl2_session_t *s = vcl2_session_get (h);
@@ -538,6 +550,7 @@ int vcl2_session_close (vcl2_handle_t h) {
 
   uint8_t is_listener = s->is_listener;
   uint64_t vpp_handle = s->vpp_handle;
+  disc_mq = s->vpp_evt_q ? s->vpp_evt_q : vm->vpp_evt_q;
 
   /* listener：清理 accept_q 里未取走的子 session（已 accept 的不在此列） */
   if (is_listener) {
@@ -545,11 +558,14 @@ int vcl2_session_close (vcl2_handle_t h) {
     for (i = 0; i < vec_len (s->accept_q); i++) {
       vcl2_session_t *cs = vcl2_session_get (s->accept_q[i]);
       if (cs && cs->vpp_handle) {
-        vec_add1 (child_disc, cs->vpp_handle);
+        cd_ent.vpp_handle = cs->vpp_handle;
+        cd_ent.evt_q = cs->vpp_evt_q ? cs->vpp_evt_q : vm->vpp_evt_q;
+        vec_add1 (child_disc, cd_ent);
         hash_unset (vm->handle_to_session, (uword) s->accept_q[i]);
         hash_unset (vm->vpp_handle_to_session, (uword) cs->vpp_handle);
         cs->in_use = 0;
         cs->rx_fifo = cs->tx_fifo = 0;
+        cs->vpp_evt_q = 0;
         cs->vpp_handle = 0;
       }
     }
@@ -561,6 +577,7 @@ int vcl2_session_close (vcl2_handle_t h) {
   vec_free (s->accept_q);
   s->in_use = 0;
   s->rx_fifo = s->tx_fifo = 0;
+  s->vpp_evt_q = 0;
   s->is_listener = 0;
   s->vpp_handle = 0;
   clib_rwlock_writer_unlock (&vm->sessions_lock);
@@ -598,33 +615,34 @@ int vcl2_session_close (vcl2_handle_t h) {
       }
       vm->unlisten_ctx = ~0;
     }
-  } else if (!is_listener && vpp_handle && vm->vpp_evt_q) {
+  } else if (!is_listener && vpp_handle && disc_mq) {
     app_session_evt_t ae;
     session_disconnect_msg_t *mp;
-    app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae, SESSION_CTRL_EVT_DISCONNECT);
+    app_alloc_ctrl_evt_to_vpp (disc_mq, &ae, SESSION_CTRL_EVT_DISCONNECT);
     mp = (session_disconnect_msg_t *) ae.evt->data;
     memset (mp, 0, sizeof (*mp));
     mp->client_index = vm->api_client_handle;
     mp->handle = vpp_handle;
-    app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+    app_send_ctrl_evt_to_vpp (disc_mq, &ae);
     VCL2_DBG ("DISCONNECT sent handle=%u vpp=0x%llx", h,
               (unsigned long long) vpp_handle);
   }
 
-  /* listener 关闭时，给 accept_q 里未取走的子 session 各发 DISCONNECT */
+  /* listener 关闭时，给 accept_q 里未取走的子 session 各发 DISCONNECT（各经其
+   * 所属线程的 evt_q，否则多核下错线程触发 app_worker_add_event 断言 panic） */
   if (child_disc) {
-    u64 *vh;
-    vec_foreach (vh, child_disc) {
-      if (vm->vpp_evt_q) {
+    struct { uint64_t vpp_handle; svm_msg_q_t *evt_q; } *cd;
+    vec_foreach (cd, child_disc) {
+      if (cd->evt_q) {
         app_session_evt_t ae;
         session_disconnect_msg_t *mp;
-        app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae,
+        app_alloc_ctrl_evt_to_vpp (cd->evt_q, &ae,
                                    SESSION_CTRL_EVT_DISCONNECT);
         mp = (session_disconnect_msg_t *) ae.evt->data;
         memset (mp, 0, sizeof (*mp));
         mp->client_index = vm->api_client_handle;
-        mp->handle = *vh;
-        app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+        mp->handle = cd->vpp_handle;
+        app_send_ctrl_evt_to_vpp (cd->evt_q, &ae);
       }
     }
     vec_free (child_disc);
@@ -640,6 +658,7 @@ int vcl2_session_shutdown (vcl2_handle_t h, int how) {
   vcl2_main_t *vm = &vcl2_main;
   uint64_t vpp_handle;
   uint8_t send_shutdown;
+  svm_msg_q_t *mq = 0;
 
   clib_rwlock_writer_lock (&vm->sessions_lock);
   vcl2_session_t *s = vcl2_session_get (h);
@@ -653,17 +672,18 @@ int vcl2_session_shutdown (vcl2_handle_t h, int how) {
   if (send_shutdown)
     s->wr_shutdown = 1;
   vpp_handle = s->vpp_handle;
+  mq = s->vpp_evt_q ? s->vpp_evt_q : vm->vpp_evt_q;
   clib_rwlock_writer_unlock (&vm->sessions_lock);
 
-  if (send_shutdown && vpp_handle && vm->vpp_evt_q) {
+  if (send_shutdown && vpp_handle && mq) {
     app_session_evt_t ae;
     session_shutdown_msg_t *mp;
-    app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae, SESSION_CTRL_EVT_SHUTDOWN);
+    app_alloc_ctrl_evt_to_vpp (mq, &ae, SESSION_CTRL_EVT_SHUTDOWN);
     mp = (session_shutdown_msg_t *) ae.evt->data;
     memset (mp, 0, sizeof (*mp));
     mp->client_index = vm->api_client_handle;
     mp->handle = vpp_handle;
-    app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+    app_send_ctrl_evt_to_vpp (mq, &ae);
     VCL2_DBG ("SHUTDOWN sent handle=%u vpp=0x%llx how=%d", h,
               (unsigned long long) vpp_handle, how);
   }
@@ -821,6 +841,7 @@ int vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t *out) {
     int got = 0, have_cs = 0;
     uint32_t accept_context = 0, cs_vpp_session_index = 0;
     uint64_t cs_vpp_handle = 0;
+    svm_msg_q_t *cs_mq = 0;
     clib_rwlock_writer_lock (
       &vm->sessions_lock); /* pop accept_q，取子 session 字段 */
     s = vcl2_session_get (listener_h);
@@ -832,6 +853,11 @@ int vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t *out) {
         accept_context = cs->accept_context;
         cs_vpp_handle = cs->vpp_handle;
         cs_vpp_session_index = cs->vpp_session_index;
+        /* 【多核修复】ACCEPTED_REPLY 必须经该子 session 所属线程的 evt_q 回 VPP，
+         * 否则 session_mq_accepted_reply_handler→app_worker_rx_notify→
+         * app_worker_add_event 断言 s->thread_index==cur 触发 panic。
+         * 此前用全局 vm->vpp_evt_q（= 某一个线程），多核 RSS 下错线程。 */
+        cs_mq = cs->vpp_evt_q ? cs->vpp_evt_q : vm->vpp_evt_q;
         have_cs = 1;
       }
       got = 1;
@@ -839,17 +865,17 @@ int vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t *out) {
     clib_rwlock_writer_unlock (&vm->sessions_lock);
     if (got) {
       /* 解锁后回 ACCEPTED_REPLY（避免 send 阻塞持写锁）*/
-      if (have_cs && vm->vpp_evt_q) {
+      if (have_cs && cs_mq) {
         app_session_evt_t ae;
         session_accepted_reply_msg_t *rm;
-        app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae,
+        app_alloc_ctrl_evt_to_vpp (cs_mq, &ae,
                                    SESSION_CTRL_EVT_ACCEPTED_REPLY);
         rm = (session_accepted_reply_msg_t *) ae.evt->data;
         rm->context = accept_context;
         rm->retval = 0;
         rm->handle = cs_vpp_handle;
         rm->app_session_index = cs_vpp_session_index;
-        app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+        app_send_ctrl_evt_to_vpp (cs_mq, &ae);
       }
       *out = ch;
       return 0;
@@ -894,6 +920,7 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
       session_disconnected_msg_t *dm = (session_disconnected_msg_t *) e->data;
       clib_rwlock_writer_lock (&vm->sessions_lock);
       vcl2_session_t *ds = vcl2_session_get_by_vpp_handle (dm->handle);
+      svm_msg_q_t *ds_mq = 0;
       if (ds) {
         ds->peer_closed = 1;
         /* 【关键·crash 根因修复】peer 断开后 VPP 会释放/清零 session 的 fifo
@@ -904,21 +931,23 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
 	       * 的尾部数据（peer 已断，可接受）。*/
         ds->rx_fifo = 0;
         ds->tx_fifo = 0;
+        /* DISCONNECTED_REPLY 同样须经该 session 所属线程的 evt_q（多核 RSS） */
+        ds_mq = ds->vpp_evt_q ? ds->vpp_evt_q : vm->vpp_evt_q;
         VCL2_DBG (
           "DISCONNECTED handle=%u vpp=0x%llx (peer_closed, fifos nulled)",
           ds->handle, (unsigned long long) dm->handle);
       }
       clib_rwlock_writer_unlock (&vm->sessions_lock);
-      if (vm->vpp_evt_q) {
+      if (ds_mq) {
         app_session_evt_t ae;
         session_disconnected_reply_msg_t *rm;
-        app_alloc_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae,
+        app_alloc_ctrl_evt_to_vpp (ds_mq, &ae,
                                    SESSION_CTRL_EVT_DISCONNECTED_REPLY);
         rm = (session_disconnected_reply_msg_t *) ae.evt->data;
         rm->context = vm->api_client_handle;
         rm->retval = 0;
         rm->handle = dm->handle;
-        app_send_ctrl_evt_to_vpp (vm->vpp_evt_q, &ae);
+        app_send_ctrl_evt_to_vpp (ds_mq, &ae);
       }
     } else if (e->event_type == SESSION_CTRL_EVT_ACCEPTED) {
       session_accepted_msg_t *am = (session_accepted_msg_t *) e->data;

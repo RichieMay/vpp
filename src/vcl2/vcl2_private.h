@@ -72,6 +72,12 @@ typedef struct {
   uint32_t vpp_session_index; /* handle 低 32 位（IO 事件回填用） */
   svm_fifo_t *rx_fifo;        /* 读：peer→app 数据（VPP-owned 段内指针） */
   svm_fifo_t *tx_fifo;        /* 写：app→peer 数据（VPP-owned 段内指针） */
+  svm_msg_q_t
+    *vpp_evt_q; /* 每 session 的 RX mq：位于该 session 所属 VPP worker 线程。
+                  * send/DISCONNECT/SHUTDOWN/ACCEPTED_REPLY/DISCONNECTED_REPLY
+                  * 必须经它回 VPP——VPP 在 app_worker_add_event 断言
+                  * s->thread_index==vlib_get_thread_index()，错线程即 panic。
+                  * （多核 RSS 下各 session 分属不同 worker；单核时全部 == thread1） */
   uint8_t in_use;
   uint8_t
     nonblocking; /* fcntl(F_SETFL O_NONBLOCK)/ioctl(FIONBIO) 设置：recv/send 无数据/空间时返回 EAGAIN */
