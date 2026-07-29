@@ -708,7 +708,6 @@ int vcl2_session_listen (vcl2_handle_t h, uint32_t q_len) {
   vcl2_main_t *vm = &vcl2_main;
   app_session_evt_t app_evt;
   session_listen_msg_t *mp;
-  int i;
   (void) q_len;
 
   if (PREDICT_FALSE (!vm->ctrl_mq || !vm->app_event_queue))
@@ -806,7 +805,6 @@ int vcl2_session_listen (vcl2_handle_t h, uint32_t q_len) {
  */
 int vcl2_session_accept (vcl2_handle_t listener_h, vcl2_handle_t *out) {
   vcl2_main_t *vm = &vcl2_main;
-  int i;
 
   if (!out)
     return -EINVAL;
