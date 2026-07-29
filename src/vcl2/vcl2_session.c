@@ -631,7 +631,7 @@ int vcl2_session_close (vcl2_handle_t h) {
   /* listener 关闭时，给 accept_q 里未取走的子 session 各发 DISCONNECT（各经其
    * 所属线程的 evt_q，否则多核下错线程触发 app_worker_add_event 断言 panic） */
   if (child_disc) {
-    struct { uint64_t vpp_handle; svm_msg_q_t *evt_q; } *cd;
+    __typeof__ (child_disc) cd;
     vec_foreach (cd, child_disc) {
       if (cd->evt_q) {
         app_session_evt_t ae;
