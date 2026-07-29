@@ -40,9 +40,9 @@ extern int vcl2_debug;
 #define VCL2_FD_BASE_DEFAULT 256
 
 /* 默认配置（镜像 vcl 合理默认；可被 env/VCL2_CONFIG 覆盖，P1 用默认） */
-#define VCL2_RX_FIFO_SIZE_DEFAULT (4 << 20)
+#define VCL2_RX_FIFO_SIZE_DEFAULT (16 << 20)
 #define VCL2_TX_FIFO_SIZE_DEFAULT (4 << 20)
-#define VCL2_SEGMENT_SIZE_DEFAULT (4 << 26)
+#define VCL2_SEGMENT_SIZE_DEFAULT (8 << 26)
 #define VCL2_EVT_QUEUE_SIZE_DEFAULT 100000
 
 /**
