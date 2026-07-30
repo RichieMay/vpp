@@ -1504,6 +1504,14 @@ vnet_shutdown_session (vnet_shutdown_args_t *a)
     return SESSION_E_NOSESSION;
 
   app_wrk = app_worker_get (s->app_wrk_index);
+  if (!app_wrk)
+    {
+      /* app_wrk_index 指向已释放/越界的 app_worker（断连 churn 下 session 槽
+       * use-after-free 的典型征象：handle 有效但 app_wrk_index 脏）。VPP 拥有
+       * session 资源，须对自身断连/关闭路径稳健——不得解引用脏指针崩溃。按既有
+       * app_worker_get→_if_valid 模式（与 session.c/session_api.c 等一致）守卫。*/
+      return SESSION_E_NOSESSION;
+    }
   if (app_wrk->app_index != a->app_index)
     return SESSION_E_OWNER;
 
@@ -1525,6 +1533,14 @@ vnet_disconnect_session (vnet_disconnect_args_t *a)
     return SESSION_E_NOSESSION;
 
   app_wrk = app_worker_get (s->app_wrk_index);
+  if (!app_wrk)
+    {
+      /* app_wrk_index 指向已释放/越界的 app_worker（断连 churn 下 session 槽
+       * use-after-free 的典型征象：handle 有效但 app_wrk_index 脏）。VPP 拥有
+       * session 资源，须对自身断连/关闭路径稳健——不得解引用脏指针崩溃。按既有
+       * app_worker_get→_if_valid 模式（与 session.c/session_api.c 等一致）守卫。*/
+      return SESSION_E_NOSESSION;
+    }
   if (app_wrk->app_index != a->app_index)
     return SESSION_E_OWNER;
 

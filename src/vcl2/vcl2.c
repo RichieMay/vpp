@@ -541,6 +541,31 @@ static int vcl2_heap_alloc (void) {
   return 0;
 }
 
+/* 解析 "size" env：支持 123 / 4K / 16M / 2G（1024 进制）。空/非法 → 返回 def。
+ * 用于让 rx/tx fifo、segment、evt_queue 可按负载调（iperf 大 fifo，nginx 多连接小 fifo）。*/
+static u64
+vcl2_cfg_size (const char *name, u64 def)
+{
+  const char *s = getenv (name);
+  if (!s || !s[0])
+    return def;
+  char *end = NULL;
+  unsigned long long v = strtoull (s, &end, 0);
+  if (end == s) /* 无数字 */
+    return def;
+  if (end && *end)
+    {
+      switch (*end)
+	{
+	case 'k': case 'K': v <<= 10; break;
+	case 'm': case 'M': v <<= 20; break;
+	case 'g': case 'G': v <<= 30; break;
+	default: break;
+	}
+    }
+  return (u64) v;
+}
+
 int vcl2_init (const char *app_name) {
   vcl2_main_t *vm = &vcl2_main;
   const char *s;
@@ -591,11 +616,12 @@ int vcl2_init (const char *app_name) {
   vm->tls_ckpair_index = ~0;
   vm->unlisten_ctx = ~0;
 
-  /* 配置默认（P1 用默认；后续可读 VCL2_CONFIG） */
-  vm->rx_fifo_size = VCL2_RX_FIFO_SIZE_DEFAULT;
-  vm->tx_fifo_size = VCL2_TX_FIFO_SIZE_DEFAULT;
-  vm->segment_size = VCL2_SEGMENT_SIZE_DEFAULT;
-  vm->evt_queue_size = VCL2_EVT_QUEUE_SIZE_DEFAULT;
+  /* 配置：默认适合高吞吐单/少流（iperf）；nginx 等多连接负载用 env 调小 fifo。
+   * VCL2_RX_FIFO_SIZE / VCL2_TX_FIFO_SIZE / VCL2_SEGMENT_SIZE / VCL2_EVT_QUEUE_SIZE */
+  vm->rx_fifo_size = vcl2_cfg_size ("VCL2_RX_FIFO_SIZE", VCL2_RX_FIFO_SIZE_DEFAULT);
+  vm->tx_fifo_size = vcl2_cfg_size ("VCL2_TX_FIFO_SIZE", VCL2_TX_FIFO_SIZE_DEFAULT);
+  vm->segment_size = vcl2_cfg_size ("VCL2_SEGMENT_SIZE", VCL2_SEGMENT_SIZE_DEFAULT);
+  vm->evt_queue_size = vcl2_cfg_size ("VCL2_EVT_QUEUE_SIZE", VCL2_EVT_QUEUE_SIZE_DEFAULT);
   vm->use_mq_eventfd = 1;
 
   /* 段管理器初始化（VPP-owned 段经 fifo_segment_attach 接入） */

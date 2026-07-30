@@ -317,6 +317,9 @@ void *clib_mem_vm_map_shared (void *start, uword size, int fd, uword offset,
 int clib_mem_vm_unmap (void *base);
 clib_mem_vm_map_hdr_t *clib_mem_vm_get_next_map_hdr (clib_mem_vm_map_hdr_t *
 						     hdr);
+/* 持 map_lock 遍历 vm-map-hdr 链表，返回 base 所在映射的 log2_page_sz。
+ * 见 linux/mem.c 的注释：原 clib_mem_create_heap_internal 无锁遍历竞态修复。*/
+clib_mem_page_sz_t clib_mem_vm_lookup_log2_page_sz (void *base);
 
 static_always_inline clib_mem_page_sz_t
 clib_mem_get_log2_page_size (void)

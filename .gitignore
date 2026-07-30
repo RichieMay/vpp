@@ -1,6 +1,6 @@
 *~
 *.sw[op]
-
+/build
 /build-root/.ccache
 /build-root/build-*/
 /build-root/install-*/

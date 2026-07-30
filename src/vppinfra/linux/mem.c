@@ -304,6 +304,34 @@ clib_mem_vm_get_next_map_hdr (clib_mem_vm_map_hdr_t * hdr)
   return next;
 }
 
+/*
+ * 持 map_lock 遍历 vm-map-hdr 链表，返回 base 所在映射的 log2_page_sz。
+ *
+ * 修复：clib_mem_create_heap_internal 原先【无锁】遍历该链表（经
+ * clib_mem_vm_get_next_map_hdr），与并发的 clib_mem_vm_map_internal/unmap（持
+ * map_lock 修改链表）竞态——churn（nginx reload/restart/异常退出下大量 segment
+ * 并发创建/销毁）时遍历会走到已释放节点（mprotect PROT_NONE 页）→ SIGSEGV（故障
+ * 地址页对齐，即 mprotect 页），即 clib_mem_create_heap_internal +0x4d 崩。
+ * VPP 拥有 segment/映射生命周期，遍历须持锁。
+ */
+__clib_export clib_mem_page_sz_t
+clib_mem_vm_lookup_log2_page_sz (void *base)
+{
+  clib_mem_vm_map_hdr_t *hdr = 0;
+  clib_mem_page_sz_t log2_page_sz = clib_mem_get_log2_page_size ();
+
+  map_lock ();
+  while ((hdr = clib_mem_vm_get_next_map_hdr (hdr)))
+    {
+      if (pointer_to_uword (base) >= hdr->base_addr &&
+	  pointer_to_uword (base) <
+	    hdr->base_addr + (hdr->num_pages << hdr->log2_page_sz))
+	log2_page_sz = hdr->log2_page_sz;
+    }
+  map_unlock ();
+  return log2_page_sz;
+}
+
 void *
 clib_mem_vm_map_internal (void *base, clib_mem_page_sz_t log2_page_sz,
 			  uword size, int fd, u8 log2_align, uword offset,

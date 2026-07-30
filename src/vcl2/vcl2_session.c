@@ -550,7 +550,9 @@ int vcl2_session_close (vcl2_handle_t h) {
 
   uint8_t is_listener = s->is_listener;
   uint64_t vpp_handle = s->vpp_handle;
+  uint8_t peer_closed = s->peer_closed;
   disc_mq = s->vpp_evt_q ? s->vpp_evt_q : vm->vpp_evt_q;
+  uint8_t disc_is_global = (disc_mq == vm->vpp_evt_q);
 
   /* listener：清理 accept_q 里未取走的子 session（已 accept 的不在此列） */
   if (is_listener) {
@@ -624,8 +626,9 @@ int vcl2_session_close (vcl2_handle_t h) {
     mp->client_index = vm->api_client_handle;
     mp->handle = vpp_handle;
     app_send_ctrl_evt_to_vpp (disc_mq, &ae);
-    VCL2_DBG ("DISCONNECT sent handle=%u vpp=0x%llx", h,
-              (unsigned long long) vpp_handle);
+    VCL2_DBG ("DISCONNECT sent handle=%u vpp=0x%llx peer_closed=%u "
+              "disc_is_global=%u pid=%d", h, (unsigned long long) vpp_handle,
+              peer_closed, disc_is_global, (int) getpid ());
   }
 
   /* listener 关闭时，给 accept_q 里未取走的子 session 各发 DISCONNECT（各经其
@@ -643,6 +646,9 @@ int vcl2_session_close (vcl2_handle_t h) {
         mp->client_index = vm->api_client_handle;
         mp->handle = cd->vpp_handle;
         app_send_ctrl_evt_to_vpp (cd->evt_q, &ae);
+        VCL2_DBG ("DISCONNECT(child) sent vpp=0x%llx disc_is_global=%u pid=%d",
+                  (unsigned long long) cd->vpp_handle,
+                  (cd->evt_q == vm->vpp_evt_q), (int) getpid ());
       }
     }
     vec_free (child_disc);

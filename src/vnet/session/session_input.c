@@ -230,6 +230,8 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 	  break;
 	case SESSION_CTRL_EVT_DISCONNECTED:
 	  s = session_get (evt->session_index, thread_index);
+	  if (!s)
+	    break;
 	  s->flags &= ~SESSION_F_RX_READY;
 	  if (s->flags & SESSION_F_APP_CLOSED)
 	    break;
@@ -238,6 +240,8 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 	  break;
 	case SESSION_CTRL_EVT_RESET:
 	  s = session_get (evt->session_index, thread_index);
+	  if (!s)
+	    break;
 	  s->flags &= ~SESSION_F_RX_READY;
 	  if (s->flags & SESSION_F_APP_CLOSED)
 	    break;
@@ -253,6 +257,8 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 	  break;
 	case SESSION_CTRL_EVT_MIGRATED:
 	  s = session_get (evt->session_index, thread_index);
+	  if (!s)
+	    break;
 	  app->cb_fns.session_migrate_callback (s, evt->as_u64[1]);
 	  transport_cleanup (session_get_transport_proto (s),
 			     s->connection_index, s->thread_index);
@@ -262,6 +268,8 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 	  break;
 	case SESSION_CTRL_EVT_TRANSPORT_CLOSED:
 	  s = session_get (evt->session_index, thread_index);
+	  if (!s)
+	    break;
 	  /* Notification enqueued before session was refused by app */
 	  if (PREDICT_FALSE (s->app_wrk_index == APP_INVALID_INDEX))
 	    break;
@@ -270,6 +278,8 @@ app_worker_flush_events_inline (app_worker_t *app_wrk,
 	  break;
 	case SESSION_CTRL_EVT_CLEANUP:
 	  s = session_get (evt->as_u64[0] & 0xffffffff, thread_index);
+	  if (!s)
+	    break;
 	  /* Notification enqueued before session was refused by app */
 	  if (PREDICT_TRUE (s->app_wrk_index != APP_INVALID_INDEX))
 	    {
@@ -365,14 +375,23 @@ session_wrk_flush_events (session_worker_t *wrk)
 
   while (app_wrk_index != ~0)
     {
-      app_wrk = app_worker_get_if_valid (app_wrk_index);
-      /* app_wrk events are flushed on free, so should be valid here */
-      ASSERT (app_wrk != 0);
+      /* wrk_evts_get 取引用：app_worker_free 标 aw_is_freed 后返回 NULL（清 stale
+       * 位跳过），否则 refcount++ 保证 flush 期间 wrk_evts 不被 free。用完 put
+       * 释放（可能触发 ref→0 自清理）。*/
+      app_wrk = app_worker_wrk_evts_get (app_wrk_index);
+      if (!app_wrk)
+	{
+	  clib_bitmap_set (wrk->app_wrks_pending_ntf, app_wrk_index, 0);
+	  app_wrk_index =
+	    clib_bitmap_next_set (wrk->app_wrks_pending_ntf, app_wrk_index + 1);
+	  continue;
+	}
       app_wrk_flush_wrk_events (app_wrk, thread_index);
 
       if (!clib_fifo_elts (app_wrk->wrk_evts[thread_index]))
 	clib_bitmap_set (wrk->app_wrks_pending_ntf, app_wrk->wrk_index, 0);
 
+      app_worker_wrk_evts_put (app_wrk);
       app_wrk_index =
 	clib_bitmap_next_set (wrk->app_wrks_pending_ntf, app_wrk_index + 1);
     }

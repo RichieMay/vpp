@@ -24,6 +24,7 @@ app_worker_alloc (application_t * app)
   app_wrk->wrk_map_index = ~0;
   app_wrk->connects_seg_manager = APP_INVALID_SEGMENT_MANAGER_INDEX;
   clib_spinlock_init (&app_wrk->detached_seg_managers_lock);
+  clib_spinlock_init (&app_wrk->aw_lock);
   vec_validate (app_wrk->wrk_evts, vlib_num_workers ());
   vec_validate (app_wrk->wrk_mq_congested, vlib_num_workers ());
   APP_DBG ("New app %v worker %u", app->name, app_wrk->wrk_index);
@@ -39,13 +40,43 @@ app_worker_get (u32 wrk_index)
 app_worker_t *
 app_worker_get_if_valid (u32 wrk_index)
 {
+  app_worker_t *app_wrk;
   if (pool_is_free_index (app_workers, wrk_index))
     return 0;
-  return pool_elt_at_index (app_workers, wrk_index);
+  app_wrk = pool_elt_at_index (app_workers, wrk_index);
+  /* app_worker_free 已标记拆除 → 视同无效，避免 category-1 调用者拿到正在被
+   * 拆除的 app_worker。wrk_evts 的并发由下面的引用计数管。*/
+  if (app_wrk->aw_is_freed)
+    return 0;
+  return app_wrk;
 }
 
-void
-app_worker_free (app_worker_t * app_wrk)
+/*
+ * wrk_evts 引用计数自清理（见 app_worker_t.aw_lock 注释）：flush(session_input)
+ * 持 wrk_evts 跨越 app_worker_free 时，refcount 保证 free 的 wrk_evts drain+释放+
+ * pool_put 延迟到最后一个 flush 退出（ref→0）自清理，消除 use-after-free。
+ */
+app_worker_t *
+app_worker_wrk_evts_get (u32 wrk_index)
+{
+  app_worker_t *app_wrk;
+  if (pool_is_free_index (app_workers, wrk_index))
+    return 0;
+  app_wrk = pool_elt_at_index (app_workers, wrk_index);
+  clib_spinlock_lock (&app_wrk->aw_lock);
+  if (app_wrk->aw_is_freed)
+    {
+      clib_spinlock_unlock (&app_wrk->aw_lock);
+      return 0;
+    }
+  app_wrk->wrk_evts_refcount++;
+  clib_spinlock_unlock (&app_wrk->aw_lock);
+  return app_wrk;
+}
+
+/* ref→0 自清理：调用时无在用 flush（refcount==0 且 aw_is_freed），aw_lock 可释放。*/
+static void
+app_worker_wrk_evts_destroy (app_worker_t *app_wrk)
 {
   application_t *app = application_get (app_wrk->app_index);
   session_handle_t handle, *handles = 0, *sh;
@@ -56,20 +87,10 @@ app_worker_free (app_worker_t * app_wrk)
   u32 sm_index;
   int i;
 
-  /*
-   * Cleanup vpp wrk events
-   */
-  app_worker_del_all_events (app_wrk);
-  for (i = 0; i < vec_len (app_wrk->wrk_evts); i++)
-    clib_fifo_free (app_wrk->wrk_evts[i]);
-
-  vec_free (app_wrk->wrk_evts);
-  vec_free (app_wrk->wrk_mq_congested);
-
-  /*
-   *  Listener cleanup
-   */
-
+  /* 整个 session/transport 拆除移到这里（ref→0 路径）：只在无在用 flush 时执行，
+   * 故 flush 处理事件时引用的 sessions/connections 此时仍存活 → 根除"拆除与 flush
+   * 并发"的竞态（tcp_connection_cleanup(NULL) 等一系列崩溃的根因）。app_worker_free
+   * 已标 aw_is_freed，新 flush 不会再处理本 app_worker 的事件。*/
   hash_foreach (handle, sm_index, app_wrk->listeners_table, ({
     ls = listen_session_get_from_handle (handle);
     vec_add1 (handles, app_listen_session_handle (ls));
@@ -79,7 +100,6 @@ app_worker_free (app_worker_t * app_wrk)
 
   for (i = 0; i < vec_len (handles); i++)
     {
-      /* Cleanup listener */
       a->app_index = app->app_index;
       a->wrk_map_index = app_wrk->wrk_map_index;
       a->handle = handles[i];
@@ -96,10 +116,6 @@ app_worker_free (app_worker_t * app_wrk)
   vec_free (sm_indices);
   hash_free (app_wrk->listeners_table);
 
-  /*
-   * Connects segment manager cleanup
-   */
-
   if (app_wrk->connects_seg_manager != APP_INVALID_SEGMENT_MANAGER_INDEX)
     {
       sm = segment_manager_get (app_wrk->connects_seg_manager);
@@ -108,18 +124,10 @@ app_worker_free (app_worker_t * app_wrk)
       segment_manager_init_free (sm);
     }
 
-  /*
-   * Half-open cleanup
-   */
-
   pool_foreach (sh, app_wrk->half_open_table)
     session_cleanup_half_open (*sh);
-
   pool_free (app_wrk->half_open_table);
 
-  /*
-   * Detached listener segment managers cleanup
-   */
   for (i = 0; i < vec_len (app_wrk->detached_seg_managers); i++)
     {
       sm = segment_manager_get (app_wrk->detached_seg_managers[i]);
@@ -128,9 +136,53 @@ app_worker_free (app_worker_t * app_wrk)
   vec_free (app_wrk->detached_seg_managers);
   clib_spinlock_free (&app_wrk->detached_seg_managers_lock);
 
+  vec_free (app_wrk->wrk_mq_congested);
+
+  app_worker_del_all_events (app_wrk);
+  for (i = 0; i < vec_len (app_wrk->wrk_evts); i++)
+    clib_fifo_free (app_wrk->wrk_evts[i]);
+  vec_free (app_wrk->wrk_evts);
+  clib_spinlock_free (&app_wrk->aw_lock);
   if (CLIB_DEBUG)
     clib_memset (app_wrk, 0xfe, sizeof (*app_wrk));
   pool_put (app_workers, app_wrk);
+}
+
+void
+app_worker_wrk_evts_put (app_worker_t *app_wrk)
+{
+  u8 do_destroy = 0;
+  clib_spinlock_lock (&app_wrk->aw_lock);
+  if (--app_wrk->wrk_evts_refcount == 0 && app_wrk->wrk_evts_free_pending)
+    do_destroy = 1;
+  clib_spinlock_unlock (&app_wrk->aw_lock);
+  if (do_destroy)
+    app_worker_wrk_evts_destroy (app_wrk);
+}
+
+void
+app_worker_free (app_worker_t * app_wrk)
+{
+  /*
+   * 标记正在拆除：wrk_evts_get / get_if_valid 之后拒绝新引用。【整个 session/transport
+   * 拆除（listener/segment/half-open/detached——释放 sessions/connections 的部分）
+   * 延后到所有在用 flush 退出（ref→0）由 wrk_evts_destroy 自清理】。这样新事件不再
+   * 被 flush 处理，在用 flush 退出后才拆除 sessions/connections → 根除"flush 处理
+   * 事件引用的 session/connection 被并发拆除"的竞态（tcp_connection_cleanup(NULL)
+   * 等一系列崩溃的根因），不再需要逐点判空守卫。
+   */
+  clib_spinlock_lock (&app_wrk->aw_lock);
+  app_wrk->aw_is_freed = 1;
+  if (app_wrk->wrk_evts_refcount == 0)
+    {
+      clib_spinlock_unlock (&app_wrk->aw_lock);
+      app_worker_wrk_evts_destroy (app_wrk);
+    }
+  else
+    {
+      app_wrk->wrk_evts_free_pending = 1;
+      clib_spinlock_unlock (&app_wrk->aw_lock);
+    }
 }
 
 application_t *

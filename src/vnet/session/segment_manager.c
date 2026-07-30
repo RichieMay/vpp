@@ -178,8 +178,9 @@ segment_manager_add_segment_inline (segment_manager_t *sm, uword segment_size,
   else
     segment_size = round_pow2 (segment_size, clib_mem_get_page_size ());
 
-  seg_name = format (0, "seg-%u-%u-%u%c", app_wrk->app_index,
-		     app_wrk->wrk_index, smm->seg_name_counter++, 0);
+  seg_name = format (0, "seg-%u-%u-%u%c", app_wrk ? app_wrk->app_index : 0,
+		     app_wrk ? app_wrk->wrk_index : 0, smm->seg_name_counter++,
+		     0);
 
   fs->ssvm.ssvm_size = segment_size;
   fs->ssvm.name = seg_name;
@@ -221,7 +222,7 @@ segment_manager_add_segment_inline (segment_manager_t *sm, uword segment_size,
   fs->flags &= ~FIFO_SEGMENT_F_MEM_LIMIT;
   fs->h->pct_first_alloc = props->pct_first_alloc;
 
-  if (notify_app)
+  if (notify_app && app_wrk)
     {
       u64 fs_handle;
 
@@ -266,7 +267,14 @@ segment_manager_del_segment (segment_manager_t *sm, fifo_segment_t *fs)
 	  u64 segment_handle;
 	  app_wrk = app_worker_get (sm->app_wrk_index);
 	  segment_handle = segment_manager_segment_handle (sm, fs);
-	  app_worker_del_segment_notify (app_wrk, segment_handle);
+	  /* 若 sm->app_wrk_index 指向已释放的 app_worker（reload/restart 下死 worker
+	   * 的 session/segment 回收时常见），跳过 notify——否则
+	   * app_worker_del_segment_notify→app_worker_add_event_custom 会往脏 mq
+	   * 写，腐蚀任意内存（含全局 vm-map-hdr 链表，进而触发 accept 建 heap 时
+	   * clib_mem_create_heap_internal 崩）。segment 仍在下面正常释放。VPP 拥有
+	   * segment 资源，须对自身回收路径稳健。*/
+	  if (app_wrk)
+	    app_worker_del_segment_notify (app_wrk, segment_handle);
 	}
     }
 
@@ -510,7 +518,7 @@ segment_manager_cleanup_detached_listener (segment_manager_t * sm)
 {
   app_worker_t *app_wrk;
 
-  app_wrk = app_worker_get_if_valid (sm->app_wrk_index);
+  app_wrk = app_worker_get (sm->app_wrk_index);
   if (!app_wrk)
     return;
 
@@ -1121,7 +1129,7 @@ format_segment_manager (u8 *s, va_list *args)
   application_t *app;
   u8 custom_logic;
 
-  app_wrk = app_worker_get_if_valid (sm->app_wrk_index);
+  app_wrk = app_worker_get (sm->app_wrk_index);
   app = app_wrk ? application_get (app_wrk->app_index) : 0;
   custom_logic = (app && (app->cb_fns.fifo_tuning_callback)) ? 1 : 0;
   max_fifo_size = sm->max_fifo_size;

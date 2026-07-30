@@ -154,7 +154,11 @@ u32 vlib_frame_queue_main_init (u32 node_index, u32 frame_queue_nelts);
 /* long barrier timeout, for gdb... */
 #define BARRIER_SYNC_TIMEOUT (600.1)
 #else
-#define BARRIER_SYNC_TIMEOUT (1.0)
+/* 原 1.0s 对高吞吐部署太短：worker 每 ~30ms 检查 barrier，但高 rps(如 20000)
+ * 洪水下 worker 可能卡在 session/包处理 >1s 才到检查点 → 1.0s 误判死锁 →
+ * os_panic（reload 触发 SAPI worker-add 的 barrier_sync 尤其易中）。提到 10s：
+ * saturated worker 有充裕余量 check-in，真死锁仍 10s 内检出。*/
+#define BARRIER_SYNC_TIMEOUT (10.0)
 #endif
 
 #define vlib_worker_thread_barrier_sync(X)                                    \

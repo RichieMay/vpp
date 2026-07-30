@@ -78,6 +78,18 @@ typedef struct app_worker_
 
   /** Vector of detached listener segment managers */
   u32 *detached_seg_managers;
+
+  /*
+   * 引用计数自清理：wrk_evts 是 flush(session_input 读/drain)与
+   * app_worker_free(drain+free+pool_put)并发访问的共享资源。多 worker 高 churn
+   * 下 flush 持 app_wrk 跨越 app_worker_free 释放 wrk_evts → use-after-free 崩。
+   * aw_lock 协调 get/free 生命周期标记（不锁字段解引用）；wrk_evts_refcount 跟踪
+   * 在用 flush；free 不阻塞，refcount>0 时标 wrk_evts_free_pending，由最后一个
+   * flush 退出（ref→0）自清理（drain+free wrk_evts+pool_put）。*/
+  clib_spinlock_t aw_lock;
+  u32 wrk_evts_refcount;
+  u8 aw_is_freed;
+  u8 wrk_evts_free_pending;
 } app_worker_t;
 
 typedef struct app_worker_map_
@@ -341,6 +353,9 @@ int application_alloc_worker_and_init (application_t * app,
 				       app_worker_t ** wrk);
 app_worker_t *app_worker_get (u32 wrk_index);
 app_worker_t *app_worker_get_if_valid (u32 wrk_index);
+/* wrk_evts 引用计数自清理（flush vs app_worker_free 竞态修复）。见 app_worker_t.aw_lock。*/
+app_worker_t *app_worker_wrk_evts_get (u32 wrk_index);
+void app_worker_wrk_evts_put (app_worker_t *app_wrk);
 application_t *app_worker_get_app (u32 wrk_index);
 int app_worker_own_session (app_worker_t * app_wrk, session_t * s);
 void app_worker_free (app_worker_t * app_wrk);

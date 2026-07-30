@@ -30,6 +30,7 @@ extern int vcl2_debug;
       fprintf (stderr, "vcl2<%d>: ", (int) getpid ());                         \
       fprintf (stderr, __VA_ARGS__);                                           \
       fprintf (stderr, "\n");                                                  \
+      fflush (stderr);                                                         \
     }                                                                          \
   } while (0)
 
