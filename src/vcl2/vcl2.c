@@ -553,16 +553,24 @@ vcl2_cfg_size (const char *name, u64 def)
   unsigned long long v = strtoull (s, &end, 0);
   if (end == s) /* 无数字 */
     return def;
-  if (end && *end)
-    {
-      switch (*end)
-	{
-	case 'k': case 'K': v <<= 10; break;
-	case 'm': case 'M': v <<= 20; break;
-	case 'g': case 'G': v <<= 30; break;
-	default: break;
-	}
+  if (end && *end) {
+    switch (*end) {
+    case 'k':
+    case 'K':
+      v <<= 10;
+      break;
+    case 'm':
+    case 'M':
+      v <<= 20;
+      break;
+    case 'g':
+    case 'G':
+      v <<= 30;
+      break;
+    default:
+      break;
     }
+  }
   return (u64) v;
 }
 
@@ -689,6 +697,14 @@ void vcl2_destroy (void) {
   pthread_mutex_destroy (&vm->app_mq_lock);
   pthread_mutex_destroy (&vm->sapi_lock);
   memset (vm, 0, sizeof (*vm));
+
+  /* 显式释放 vppinfra 工作堆（init 时 mmap 的 64MB）。进程退出本由内核回收，
+   * 此处补 munmap 仅为"运行中 detach 后重新 init"场景防泄漏。clib_mem 全局 heap
+   * 指针的重置属更深层，不在本次范围；正常退出路径内核兜底，无影响。*/
+  if (vcl2_heap_base) {
+    munmap (vcl2_heap_base, VCL2_HEAP_SIZE);
+    vcl2_heap_base = 0;
+  }
 }
 
 /* ---------- session 操作（vcl2_session_connect / create / send / recv / close /

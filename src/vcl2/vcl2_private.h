@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
+#include <sys/socket.h>
 #include <vppinfra/hash.h>
 #include <vppinfra/vec.h>
 #include <vppinfra/lock.h>
@@ -171,6 +173,14 @@ typedef struct {
 
 extern vcl2_main_t vcl2_main;
 
+/* 单调时钟毫秒（CLOCK_MONOTONIC）。vppinfra 无现成 monotonic-ms helper，
+ * connect/listen/close 等 ctrl 等待循环 + ldp2 多路复用器统一用它算 deadline。*/
+static inline long vcl2_now_ms (void) {
+  struct timespec ts;
+  clock_gettime (CLOCK_MONOTONIC, &ts);
+  return (long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 #define VCL2_INVALID_SEGMENT_HANDLE ((u64) ~0)
 /* VPP worker-mq-segment 的 handle 约定（镜像 vcl_vpp_worker_segment_handle） */
 #define VCL2_VPP_WRK_SEG_HANDLE(wrk)                                           \
@@ -183,10 +193,9 @@ int vcl2_app_attach_locked (void);
 int vcl2_worker_register_locked (void);
 int vcl2_sapi_recv_fd (int *fd);
 void vcl2_atfork_prepare (void); /* fork 前：acquire 所有锁，保证 child 继承干净状态 */
-void vcl2_atfork_parent (void);  /* fork 后父进程：释放锁 + unlisten */
+void vcl2_atfork_parent (void);  /* fork 后父进程（master）：释放锁 + 从 listener accept
+                                    轮转摘除自己（unlisten），防 ACCEPTED 轮给不排空的 master */
 void vcl2_atfork_child (void);   /* fork 后子进程：释放锁 + 重建 worker 身份 */
-void vcl2_atfork_parent (
-  void); /* fork 父进程（master）：从 accept 转发摘除自己 */
 int vcl2_session_unlisten (
   vcl2_handle_t h); /* 把本 worker 移出 listener 的 accept 轮转 */
 int vcl2_handle_to_fd (vcl2_handle_t h);
@@ -209,6 +218,11 @@ int vcl2_tls_ensure_cert (void);
 
 /* session 缓存（vcl2_session.c） */
 vcl2_session_t *vcl2_session_get (vcl2_handle_t h);
+/* 回填 sockaddr（is_ip4 取 ip 前4字节，否则16字节；port 网络序）。
+ * vcl2_session_recvfrom / ldp2 getsockname/getpeername/accept 共用，去重 3 处。*/
+void vcl2_fill_sockaddr_from_ip (struct sockaddr *addr, socklen_t *addr_len,
+                                 uint8_t is_ip4, const uint8_t *ip,
+                                 uint16_t port);
 /* recvfrom：recv + 回填源地址 sockaddr（UDP per-packet / TCP 对端）。*/
 int vcl2_session_recvfrom (vcl2_handle_t h, void *buf, uint32_t len,
                            struct sockaddr *addr, socklen_t *addr_len);

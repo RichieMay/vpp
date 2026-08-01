@@ -300,17 +300,19 @@ ssize_t writev (int fd, const struct iovec *iov, int iovcnt) {
   uint8_t *heap = 0;
   for (i = 0; i < (size_t) iovcnt; i++)
     total += iov[i].iov_len;
+  size_t cap = total; /* 实际拷贝上限：通常=total；malloc 失败时截断到栈大小 */
   if (total > sizeof (stack)) {
     heap = malloc (total);
-    buf = heap ? heap : stack;
+    if (heap)
+      buf = heap;
+    else
+      cap = sizeof (stack);
   }
   size_t off = 0;
-  for (i = 0; i < (size_t) iovcnt &&
-              off < (total > sizeof (stack) && !heap ? sizeof (stack) : total);
-       i++) {
+  for (i = 0; i < (size_t) iovcnt && off < cap; i++) {
     size_t n = iov[i].iov_len;
-    if (off + n > (heap ? total : sizeof (stack)))
-      n = (heap ? total : sizeof (stack)) - off;
+    if (off + n > cap)
+      n = cap - off;
     memcpy (buf + off, iov[i].iov_base, n);
     off += n;
   }
@@ -643,11 +645,8 @@ int epoll_wait (int epfd, struct epoll_event *events, int maxevents,
   tmpcap = sizeof (tmp) / sizeof (tmp[0]);
   if (tmpcap > maxevents)
     tmpcap = maxevents;
-  if (timeout > 0) {
-    struct timespec t0;
-    clock_gettime (CLOCK_MONOTONIC, &t0);
-    deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + timeout;
-  }
+  if (timeout > 0)
+    deadline_ms = vcl2_now_ms () + timeout;
 
   /* 事件驱动：每轮 drain+collect 后，用【完整剩余超时】阻塞在真 epoll（含 eventfd）
    * 上，被 VPP 信号/真 fd/超时唤醒。只在"唤醒却无就绪 fd"时（如 eventfd 是别的
@@ -663,10 +662,7 @@ int epoll_wait (int epfd, struct epoll_event *events, int maxevents,
     if (deadline_ms < 0)
       t = VCL2_MUX_RECHECK_MS;
     else {
-      struct timespec now;
-      long now_ms;
-      clock_gettime (CLOCK_MONOTONIC, &now);
-      now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+      long now_ms = vcl2_now_ms ();
       if (now_ms >= deadline_ms)
         return 0;
       t = (int) (deadline_ms - now_ms);
@@ -680,7 +676,7 @@ int epoll_wait (int epfd, struct epoll_event *events, int maxevents,
     for (i = 0; i < m; i++) {
       if (efd >= 0 && tmp[i].data.fd == efd) {
         uint64_t b;
-        read (efd, &b, sizeof (b)); /* 清 eventfd，下轮 drain+collect */
+        libc_read (efd, &b, sizeof (b)); /* 清 eventfd，下轮 drain+collect */
       } else if (n < maxevents)
         events[n++] = tmp[i]; /* 真 fd 事件原样透传 */
     }
@@ -740,11 +736,10 @@ int bind (int fd, const struct sockaddr *addr, socklen_t len) {
    * 否则 bound 的 UDP session 无 rx_fifo，recvfrom 立即返 -EINVAL。*/
   if (is_dgram) {
     int rv = vcl2_session_listen (h, 10);
-    if (rv < 0)
-      {
-        errno = -rv;
-        return -1;
-      }
+    if (rv < 0) {
+      errno = -rv;
+      return -1;
+    }
   }
   return 0;
 }
@@ -783,24 +778,9 @@ static int ldp2_accept_common (int fd, struct sockaddr *addr,
   if (addr && addrlen) {
     clib_rwlock_reader_lock (&vcl2_main.sessions_lock);
     vcl2_session_t *cs = vcl2_session_get ((vcl2_handle_t) nh);
-    if (cs && cs->rmt_is_ip4 &&
-        *addrlen >= (socklen_t) sizeof (struct sockaddr_in)) {
-      struct sockaddr_in a;
-      memset (&a, 0, sizeof (a));
-      a.sin_family = AF_INET;
-      memcpy (&a.sin_addr, cs->rmt_ip, 4);
-      a.sin_port = cs->rmt_port;
-      memcpy (addr, &a, sizeof (a));
-      *addrlen = sizeof (a);
-    } else if (cs && *addrlen >= (socklen_t) sizeof (struct sockaddr_in6)) {
-      struct sockaddr_in6 a6;
-      memset (&a6, 0, sizeof (a6));
-      a6.sin6_family = AF_INET6;
-      memcpy (&a6.sin6_addr, cs->rmt_ip, 16);
-      a6.sin6_port = cs->rmt_port;
-      memcpy (addr, &a6, sizeof (a6));
-      *addrlen = sizeof (a6);
-    }
+    if (cs)
+      vcl2_fill_sockaddr_from_ip (addr, addrlen, cs->rmt_is_ip4, cs->rmt_ip,
+                                  cs->rmt_port);
     clib_rwlock_reader_unlock (&vcl2_main.sessions_lock);
   }
 
@@ -1013,24 +993,7 @@ static int ldp2_fill_name (int fd, struct sockaddr *addr, socklen_t *len,
     uint8_t is_ip4 = is_peer ? s->rmt_is_ip4 : s->lcl_is_ip4;
     uint8_t *ip = is_peer ? s->rmt_ip : s->lcl_ip;
     uint16_t port = is_peer ? s->rmt_port : s->lcl_port;
-
-    if (is_ip4 && *len >= (socklen_t) sizeof (struct sockaddr_in)) {
-      struct sockaddr_in a;
-      memset (&a, 0, sizeof (a));
-      a.sin_family = AF_INET;
-      memcpy (&a.sin_addr, ip, 4);
-      a.sin_port = port;
-      memcpy (addr, &a, sizeof (a));
-      *len = sizeof (a);
-    } else if (*len >= (socklen_t) sizeof (struct sockaddr_in6)) {
-      struct sockaddr_in6 a6;
-      memset (&a6, 0, sizeof (a6));
-      a6.sin6_family = AF_INET6;
-      memcpy (&a6.sin6_addr, ip, 16);
-      a6.sin6_port = port;
-      memcpy (addr, &a6, sizeof (a6));
-      *len = sizeof (a6);
-    }
+    vcl2_fill_sockaddr_from_ip (addr, len, is_ip4, ip, port);
   } else {
     ret = -1;
     errno = EBADF;
@@ -1095,11 +1058,8 @@ int poll (struct pollfd *fds, nfds_t nfds, int timeout) {
   efd = ldp2_app_evt_fd ();
   vec_validate (rp, nfds + 1); /* 真 fd + 1 个 eventfd 槽 */
   vec_validate (map, nfds + 1);
-  if (timeout > 0) {
-    struct timespec t0;
-    clock_gettime (CLOCK_MONOTONIC, &t0);
-    deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + timeout;
-  }
+  if (timeout > 0)
+    deadline_ms = vcl2_now_ms () + timeout;
   for (;;) {
     vcl2_dispatch_app_events ();
     n = 0;
@@ -1151,10 +1111,7 @@ int poll (struct pollfd *fds, nfds_t nfds, int timeout) {
     if (deadline_ms < 0)
       t = VCL2_MUX_RECHECK_MS;
     else {
-      struct timespec now;
-      long now_ms;
-      clock_gettime (CLOCK_MONOTONIC, &now);
-      now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+      long now_ms = vcl2_now_ms ();
       if (now_ms >= deadline_ms) {
         vec_free (rp);
         vec_free (map);
@@ -1167,7 +1124,7 @@ int poll (struct pollfd *fds, nfds_t nfds, int timeout) {
     libc_poll (rp, nr + 1, t);
     if (rp[nr].revents & POLLIN) {
       uint64_t b;
-      read (efd, &b, sizeof (b)); /* 清 eventfd，下轮 drain+重扫 */
+      libc_read (efd, &b, sizeof (b)); /* 清 eventfd，下轮 drain+重扫 */
     }
     for (i = 0; i < nr; i++) {
       fds[map[i]].revents = rp[i].revents;
@@ -1206,11 +1163,8 @@ int select (int nfds, fd_set *rset, fd_set *wset, fd_set *eset,
   timeout_ms =
     timeout ? (timeout->tv_sec * 1000 + timeout->tv_usec / 1000) : -1;
   efd = ldp2_app_evt_fd ();
-  if (timeout_ms > 0) {
-    struct timespec t0;
-    clock_gettime (CLOCK_MONOTONIC, &t0);
-    deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + timeout_ms;
-  }
+  if (timeout_ms > 0)
+    deadline_ms = vcl2_now_ms () + timeout_ms;
   for (;;) {
     fd_set tr, tw;
     int maxr = -1;
@@ -1296,10 +1250,7 @@ int select (int nfds, fd_set *rset, fd_set *wset, fd_set *eset,
     if (deadline_ms < 0)
       wait_ms = VCL2_MUX_RECHECK_MS;
     else {
-      struct timespec now;
-      long now_ms;
-      clock_gettime (CLOCK_MONOTONIC, &now);
-      now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+      long now_ms = vcl2_now_ms ();
       if (now_ms >= deadline_ms) {
         if (rset)
           *rset = orset;
@@ -1321,7 +1272,7 @@ int select (int nfds, fd_set *rset, fd_set *wset, fd_set *eset,
     }
     if (FD_ISSET (efd, &tr)) {
       uint64_t b;
-      read (efd, &b, sizeof (b)); /* 清 eventfd，下轮 drain+重扫 */
+      libc_read (efd, &b, sizeof (b)); /* 清 eventfd，下轮 drain+重扫 */
       FD_CLR (efd, &tr);
     }
     /* 真 fd 就绪：合并进 orset/owset 并返回 */

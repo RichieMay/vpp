@@ -287,12 +287,9 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
   /* 事件驱动等 CONNECTED：dispatch 统一处理所有事件类型（含 CONNECTED，置 ctrl_done），
    * 本循环只检测标志——不再内联 drain 丢弃其它事件。deadline 限定 + 1ms 有界重查。*/
   {
-    struct timespec t0, now;
     long deadline_ms, now_ms;
     double rem;
-    clock_gettime (CLOCK_MONOTONIC, &t0);
-    deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 +
-                  (long) (VCL2_CTRL_TIMEOUT * 1000);
+    deadline_ms = vcl2_now_ms () + (long) (VCL2_CTRL_TIMEOUT * 1000);
     for (;;) {
       uint8_t done;
       int rv;
@@ -312,8 +309,7 @@ int vcl2_session_connect (vcl2_handle_t h, uint8_t is_ip4, const uint8_t *ip,
         clib_rwlock_writer_unlock (&vm->sessions_lock);
         return rv;
       }
-      clock_gettime (CLOCK_MONOTONIC, &now);
-      now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+      now_ms = vcl2_now_ms ();
       if (now_ms >= deadline_ms)
         return -ETIMEDOUT;
       rem = (double) (deadline_ms - now_ms) / 1000.0;
@@ -396,73 +392,31 @@ int vcl2_session_send (vcl2_handle_t h, const void *buf, uint32_t len) {
 }
 
 /*
- * recv：读 rx_fifo。持读锁 dequeue；空则解锁、等（不持锁），下一轮重取。
+ * recv：读 rx_fifo。语义同 recvfrom(addr=NULL) —— 合并实现，避免重复。
  */
 int vcl2_session_recv (vcl2_handle_t h, void *buf, uint32_t len) {
-  vcl2_main_t *vm = &vcl2_main;
-  int n;
-
-  for (;;) {
-    uint8_t pc, nb;
-
-    clib_rwlock_reader_lock (&vm->sessions_lock);
-    vcl2_session_t *s = vcl2_session_get (h);
-
-    if (!s) {
-      clib_rwlock_reader_unlock (&vm->sessions_lock);
-      return -EINVAL;
-    }
-    if (s->rd_shutdown) {
-      clib_rwlock_reader_unlock (&vm->sessions_lock);
-      return 0;
-    }
-    /* rx_fifo NULL = DISCONNECTED 置 NULL（防 VPP 已清零 fifo 的 crash）*/
-    if (PREDICT_FALSE (!s->rx_fifo)) {
-      clib_rwlock_reader_unlock (&vm->sessions_lock);
-      return s->peer_closed ? 0 : -EINVAL;
-    }
-
-    /* UDP：app_recv_dgram_raw（剥 dgram 头）；TCP：app_recv_stream_raw */
-    if (s->is_dgram) {
-      app_session_transport_t at;
-      n = app_recv_dgram_raw (s->rx_fifo, (u8 *) buf, len, &at, 1, 0);
-    } else
-      n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
-    pc = s->peer_closed;
-    nb = s->nonblocking;
-    clib_rwlock_reader_unlock (&vm->sessions_lock);
-
-    if (n > 0)
-      return n;
-    if (pc)
-      return 0;
-    if (nb)
-      return -EAGAIN;
-
-    /* 阻塞：1ms 有界重查 + 排空 */
-    vcl2_mq_wait_dispatch (0.001);
-  }
-  return -ETIMEDOUT; /* not reached */
+  return vcl2_session_recvfrom (h, buf, len, NULL, NULL);
 }
 
-/* 回填源地址 sockaddr。UDP = per-packet 源（app_recv_dgram_raw 的 at）；
- * TCP = 固定对端（at 由调用者从 session rmt 填好）。端口均为网络序。*/
-static void vcl2_fill_sockaddr (struct sockaddr *addr, socklen_t *addr_len,
-                                app_session_transport_t *at) {
-  if (at->is_ip4 && *addr_len >= sizeof (struct sockaddr_in)) {
+/* 回填 sockaddr（is_ip4 取 ip 前4字节，否则16字节；port 网络序）。
+ * vcl2_session_recvfrom / ldp2 getsockname/getpeername/accept 共用，去重 3 处。*/
+void vcl2_fill_sockaddr_from_ip (struct sockaddr *addr, socklen_t *addr_len,
+                                 uint8_t is_ip4, const uint8_t *ip,
+                                 uint16_t port) {
+  if (is_ip4 && *addr_len >= sizeof (struct sockaddr_in)) {
     struct sockaddr_in a;
     memset (&a, 0, sizeof (a));
     a.sin_family = AF_INET;
-    memcpy (&a.sin_addr, &at->rmt_ip.ip4, 4);
-    a.sin_port = at->rmt_port;
+    memcpy (&a.sin_addr, ip, 4);
+    a.sin_port = port;
     memcpy (addr, &a, sizeof (a));
     *addr_len = sizeof (a);
   } else if (*addr_len >= sizeof (struct sockaddr_in6)) {
     struct sockaddr_in6 a6;
     memset (&a6, 0, sizeof (a6));
     a6.sin6_family = AF_INET6;
-    memcpy (&a6.sin6_addr, &at->rmt_ip.ip6, 16);
-    a6.sin6_port = at->rmt_port;
+    memcpy (&a6.sin6_addr, ip, 16);
+    a6.sin6_port = port;
     memcpy (addr, &a6, sizeof (a6));
     *addr_len = sizeof (a6);
   }
@@ -500,12 +454,15 @@ int vcl2_session_recvfrom (vcl2_handle_t h, void *buf, uint32_t len,
       n = app_recv_dgram_raw (s->rx_fifo, (u8 *) buf, len, &at, 1, 0);
     } else {
       n = app_recv_stream_raw (s->rx_fifo, (u8 *) buf, len, 1, 0);
-      at.is_ip4 = s->rmt_is_ip4;
-      at.rmt_port = s->rmt_port;
-      if (s->rmt_is_ip4)
-        memcpy (&at.rmt_ip.ip4, s->rmt_ip, 4);
-      else
-        memcpy (&at.rmt_ip.ip6, s->rmt_ip, 16);
+      /* 仅当调用者要回填源地址时才取对端（recv 路径 addr=NULL 不付此开销）*/
+      if (addr && addr_len) {
+        at.is_ip4 = s->rmt_is_ip4;
+        at.rmt_port = s->rmt_port;
+        if (s->rmt_is_ip4)
+          memcpy (&at.rmt_ip.ip4, s->rmt_ip, 4);
+        else
+          memcpy (&at.rmt_ip.ip6, s->rmt_ip, 16);
+      }
     }
     pc = s->peer_closed;
     nb = s->nonblocking;
@@ -513,7 +470,8 @@ int vcl2_session_recvfrom (vcl2_handle_t h, void *buf, uint32_t len,
 
     if (n > 0) {
       if (addr && addr_len)
-        vcl2_fill_sockaddr (addr, addr_len, &at);
+        vcl2_fill_sockaddr_from_ip (addr, addr_len, at.is_ip4,
+                                    (const uint8_t *) &at.rmt_ip, at.rmt_port);
       return n;
     }
     if (pc)
@@ -525,6 +483,20 @@ int vcl2_session_recvfrom (vcl2_handle_t h, void *buf, uint32_t len,
     vcl2_mq_wait_dispatch (0.001);
   }
   return -ETIMEDOUT; /* not reached */
+}
+
+/* 发 DISCONNECT 到指定 evt_q（多核下各 session 经其所属线程 mq）。client_index 取
+ * 全局；去重 close 内本 session + accept_q 未取走 child 两处消息构造。*/
+static void vcl2_send_disconnect (svm_msg_q_t *mq, uint64_t vpp_handle) {
+  vcl2_main_t *vm = &vcl2_main;
+  app_session_evt_t ae;
+  session_disconnect_msg_t *mp;
+  app_alloc_ctrl_evt_to_vpp (mq, &ae, SESSION_CTRL_EVT_DISCONNECT);
+  mp = (session_disconnect_msg_t *) ae.evt->data;
+  memset (mp, 0, sizeof (*mp));
+  mp->client_index = vm->api_client_handle;
+  mp->handle = vpp_handle;
+  app_send_ctrl_evt_to_vpp (mq, &ae);
 }
 
 /*
@@ -605,27 +577,16 @@ int vcl2_session_close (vcl2_handle_t h) {
     vm->unlisten_ctx = h;
     vm->unlisten_done = 0;
     {
-      struct timespec t0, now;
-      long deadline_ms;
-      clock_gettime (CLOCK_MONOTONIC, &t0);
-      deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 + 2000;
+      long deadline_ms = vcl2_now_ms () + 2000;
       while (!vm->unlisten_done) {
-        clock_gettime (CLOCK_MONOTONIC, &now);
-        if ((long) (now.tv_sec * 1000 + now.tv_nsec / 1000000) >= deadline_ms)
+        if (vcl2_now_ms () >= deadline_ms)
           break;
         vcl2_mq_wait_dispatch (0.001);
       }
       vm->unlisten_ctx = ~0;
     }
   } else if (!is_listener && vpp_handle && disc_mq) {
-    app_session_evt_t ae;
-    session_disconnect_msg_t *mp;
-    app_alloc_ctrl_evt_to_vpp (disc_mq, &ae, SESSION_CTRL_EVT_DISCONNECT);
-    mp = (session_disconnect_msg_t *) ae.evt->data;
-    memset (mp, 0, sizeof (*mp));
-    mp->client_index = vm->api_client_handle;
-    mp->handle = vpp_handle;
-    app_send_ctrl_evt_to_vpp (disc_mq, &ae);
+    vcl2_send_disconnect (disc_mq, vpp_handle);
     VCL2_DBG ("DISCONNECT sent handle=%u vpp=0x%llx peer_closed=%u "
               "disc_is_global=%u pid=%d", h, (unsigned long long) vpp_handle,
               peer_closed, disc_is_global, (int) getpid ());
@@ -637,15 +598,7 @@ int vcl2_session_close (vcl2_handle_t h) {
     __typeof__ (child_disc) cd;
     vec_foreach (cd, child_disc) {
       if (cd->evt_q) {
-        app_session_evt_t ae;
-        session_disconnect_msg_t *mp;
-        app_alloc_ctrl_evt_to_vpp (cd->evt_q, &ae,
-                                   SESSION_CTRL_EVT_DISCONNECT);
-        mp = (session_disconnect_msg_t *) ae.evt->data;
-        memset (mp, 0, sizeof (*mp));
-        mp->client_index = vm->api_client_handle;
-        mp->handle = cd->vpp_handle;
-        app_send_ctrl_evt_to_vpp (cd->evt_q, &ae);
+        vcl2_send_disconnect (cd->evt_q, cd->vpp_handle);
         VCL2_DBG ("DISCONNECT(child) sent vpp=0x%llx disc_is_global=%u pid=%d",
                   (unsigned long long) cd->vpp_handle,
                   (cd->evt_q == vm->vpp_evt_q), (int) getpid ());
@@ -789,12 +742,9 @@ int vcl2_session_listen (vcl2_handle_t h, uint32_t q_len) {
   /* 事件驱动等 BOUND：dispatch 统一处理（含 BOUND，置 ctrl_done + listener 身份），
    * 本循环只检测标志。deadline 限定 + 1ms 有界重查。*/
   {
-    struct timespec t0, now;
     long deadline_ms, now_ms;
     double rem;
-    clock_gettime (CLOCK_MONOTONIC, &t0);
-    deadline_ms = (long) t0.tv_sec * 1000 + t0.tv_nsec / 1000000 +
-                  (long) (VCL2_CTRL_TIMEOUT * 1000);
+    deadline_ms = vcl2_now_ms () + (long) (VCL2_CTRL_TIMEOUT * 1000);
     for (;;) {
       uint8_t done;
       int rv;
@@ -813,8 +763,7 @@ int vcl2_session_listen (vcl2_handle_t h, uint32_t q_len) {
         clib_rwlock_writer_unlock (&vm->sessions_lock);
         return rv;
       }
-      clock_gettime (CLOCK_MONOTONIC, &now);
-      now_ms = (long) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+      now_ms = vcl2_now_ms ();
       if (now_ms >= deadline_ms)
         return -ETIMEDOUT;
       rem = (double) (deadline_ms - now_ms) / 1000.0;
@@ -930,11 +879,11 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
       if (ds) {
         ds->peer_closed = 1;
         /* 【关键·crash 根因修复】peer 断开后 VPP 会释放/清零 session 的 fifo
-	       * （end_chunk→0）。在写锁内【先于 DISCONNECTED_REPLY】把 rx/tx fifo 指针
-	       * 置 NULL，使后续 recv/send 的 !fifo 检查命中、直接返回 EOF/EPIPE，绝不
-	       * 解引用已被 VPP 清零的 fifo（f_chunk_end(c=0x0) SIGSEGV）。写锁排斥所有
-	       * 正在 recv/send 的读锁持有者，故无"中途解引用"。代价：丢弃 fifo 里残留
-	       * 的尾部数据（peer 已断，可接受）。*/
+         * （end_chunk→0）。在写锁内【先于 DISCONNECTED_REPLY】把 rx/tx fifo 指针
+         * 置 NULL，使后续 recv/send 的 !fifo 检查命中、直接返回 EOF/EPIPE，绝不
+         * 解引用已被 VPP 清零的 fifo（f_chunk_end(c=0x0) SIGSEGV）。写锁排斥所有
+         * 正在 recv/send 的读锁持有者，故无"中途解引用"。代价：丢弃 fifo 里残留
+         * 的尾部数据（peer 已断，可接受）。*/
         ds->rx_fifo = 0;
         ds->tx_fifo = 0;
         /* DISCONNECTED_REPLY 同样须经该 session 所属线程的 evt_q（多核 RSS） */
@@ -999,7 +948,7 @@ void vcl2_mq_wait_dispatch (double timeout_s) {
       clib_rwlock_writer_unlock (&vm->sessions_lock);
     } else if (e->event_type == SESSION_CTRL_EVT_CONNECTED) {
       /* connect 回复：context = vcl2 handle（connect 请求所设）。attach fifos + 置
-	   * ctrl_done，让 vcl2_session_connect 的等待循环检测到并返回。*/
+       * ctrl_done，让 vcl2_session_connect 的等待循环检测到并返回。*/
       session_connected_msg_t *cm = (session_connected_msg_t *) e->data;
       clib_rwlock_writer_lock (&vm->sessions_lock);
       vcl2_session_t *cs = vcl2_session_get (cm->context);
